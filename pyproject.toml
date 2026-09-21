@@ -29,8 +29,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/heindelj/quick-mag"
-Documentation = "https://heindelj.github.io/quick-mag/"
+Homepage = "https://github.com/HeteroFAM/Quick-Mag"
+Documentation = "https://heterofam.github.io/Quick-Mag/"
 
 # Register the unified command-line tool: `quick-mag solve ...` and `quick-mag ui`.
 [project.scripts]

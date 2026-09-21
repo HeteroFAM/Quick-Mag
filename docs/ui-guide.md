@@ -12,7 +12,7 @@ runs two ways:
 
 Open the web app:
 
-**[heindelj.github.io/quick-mag/app/](https://heindelj.github.io/quick-mag/app/)**
+**[heterofam.github.io/Quick-Mag/app/](https://heterofam.github.io/Quick-Mag/app/)**
 
 The first load takes a couple seconds while the browser downloads Pyodide,
 `imgui-bundle` (the UI dependency), `numpy`, `scipy`, and the application modules.

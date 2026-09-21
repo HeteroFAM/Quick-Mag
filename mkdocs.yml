@@ -1,8 +1,8 @@
 site_name: quick_mag
 site_description: Perovskite/crystal structure builder, visualization, and collinear-magnetism tools.
-site_url: https://heindelj.github.io/quick-mag/
-repo_url: https://github.com/heindelj/quick-mag
-repo_name: heindelj/quick-mag
+site_url: https://heterofam.github.io/Quick-Mag/
+repo_url: https://github.com/HeteroFAM/Quick-Mag
+repo_name: HeteroFAM/Quick-Mag
 
 theme:
   name: material

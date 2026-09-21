@@ -1,5 +1,5 @@
 # User Interface
-This tutorial can be followed via the [quick-mag web app](https://heindelj.github.io/quick-mag/app/) which runs in your browser.
+This tutorial can be followed via the [quick-mag web app](https://heterofam.github.io/Quick-Mag/app/) which runs in your browser.
 
 ## 3D Panel
 In the center of the screen, you will see the default structure which is the $\mathrm{LaFeO_{3}}$ perovskite.

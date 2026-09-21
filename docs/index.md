@@ -6,7 +6,7 @@ their collinear magnetic ground states. There are three ways to interact with th
 - a **command-line tool** (`quick-mag build …`, `quick-mag chgnet …`, `quick-mag solve …`,
   chainable with `::`) for scripted runs,
 - an **interactive desktop UI** (`quick-mag ui`) built with Dear ImGui, and
-- the [**same UI in the browser**](https://heindelj.github.io/quick-mag/app/): the Python app compiled to WebAssembly via
+- the [**same UI in the browser**](https://heterofam.github.io/Quick-Mag/app/): the Python app compiled to WebAssembly via
   [Pyodide](https://pyodide.org).
 
 ## What it does
@@ -33,8 +33,8 @@ already have conda, follow the
 conda create -n quick-mag python=3.12
 conda activate quick-mag
 
-git clone https://github.com/heindelj/quick-mag.git
-cd quick-mag
+git clone https://github.com/HeteroFAM/Quick-Mag.git
+cd Quick-Mag
 
 pip install -e .              # core + CLI (numpy, scipy)
 pip install -e ".[ui]"        # also install the desktop/interactive UI (imgui-bundle)

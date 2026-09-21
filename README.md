@@ -10,9 +10,9 @@ exchange couplings, and low-energy collinear spin configurations can be accessed
 - an **interactive desktop app** (`quick-mag ui`), and
 - the **same UI in the browser**, compiled to WebAssembly via [Pyodide](https://pyodide.org).
 
-**Docs:** <https://heindelj.github.io/quick-mag/>
+**Docs:** <https://heterofam.github.io/Quick-Mag/>
 
-**Live web app:** <https://heindelj.github.io/quick-mag/app/>
+**Live web app:** <https://heterofam.github.io/Quick-Mag/app/>
 
 ## Install
 
@@ -25,8 +25,8 @@ yet, see the [conda installation guide](https://docs.conda.io/projects/conda/en/
 conda create -n quick-mag python=3.12
 conda activate quick-mag
 
-git clone https://github.com/heindelj/quick-mag.git
-cd quick-mag
+git clone https://github.com/HeteroFAM/Quick-Mag.git
+cd Quick-Mag
 
 pip install -e .              # core + CLI (numpy, scipy)
 pip install -e ".[ui]"        # also install the desktop/interactive UI (imgui-bundle)
@@ -55,7 +55,7 @@ quick-mag build --a-site La --b-site Mn --x-site O :: chgnet :: solve
 quick-mag ui
 ```
 
-See the [CLI reference](https://heindelj.github.io/quick-mag/cli-reference/) for all flags.
+See the [CLI reference](https://heterofam.github.io/Quick-Mag/cli-reference/) for all flags.
 
 ## Repository layout
 
@@ -69,4 +69,4 @@ scripts/           # one-off data-generation utilities
 ```
 
 ## Model
-Details of the implemented model are available in the [documentation](https://heindelj.github.io/quick-mag).
+Details of the implemented model are available in the [documentation](https://heterofam.github.io/Quick-Mag).
