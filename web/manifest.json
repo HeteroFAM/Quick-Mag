@@ -166,6 +166,18 @@
       "dest": "/app/quick_mag/spin_solver.py"
     },
     {
+      "url": "../src/quick_mag/spinel_build_cli.py",
+      "dest": "/app/quick_mag/spinel_build_cli.py"
+    },
+    {
+      "url": "../src/quick_mag/spinel_builder.py",
+      "dest": "/app/quick_mag/spinel_builder.py"
+    },
+    {
+      "url": "../src/quick_mag/spinel_composition.py",
+      "dest": "/app/quick_mag/spinel_composition.py"
+    },
+    {
       "url": "../src/quick_mag/structure.py",
       "dest": "/app/quick_mag/structure.py"
     },

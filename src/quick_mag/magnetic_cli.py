@@ -21,9 +21,13 @@ import numpy as np
 
 from quick_mag.structure import ChemicalStructure, build_from_generation_parameters
 from quick_mag.structure_utils import read_structure
-from quick_mag.oxidation_state_energy import enumerate_oxidation_states_by_energy
+from quick_mag.oxidation_state_energy import (
+    enumerate_oxidation_states_by_energy,
+    enumerate_site_group_assignments,
+)
 from quick_mag.magnetic_moments import (
     expand_distribution_to_site_assignments,
+    expand_group_assignments_to_site_assignments,
     format_oxidation_distribution,
 )
 from quick_mag.ion_descriptors import structure_ion_descriptors
@@ -52,6 +56,9 @@ def _resolve_site_indexing(structure: ChemicalStructure, magnetic_site_indices):
     magnetic sublattice onto a B grid via ``site_indexing_from_magnetic_sublattice``.
     """
     params = getattr(structure, "generation_parameters", None)
+    if params is not None and getattr(params, "family", "perovskite") != "perovskite":
+        # A spinel (or any other non-perovskite build) has no B grid to classify on.
+        return None
     if params is not None:
         try:
             build = build_from_generation_parameters(params)
@@ -240,11 +247,64 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     return parser
 
 
+def _provenance_oxidation_constraints(structure: ChemicalStructure) -> dict:
+    """Per-atom oxidation constraints recorded by the builder, if any.
+
+    Only spinels record them so far (``--oxidation`` on ``build-spinel``): a
+    restriction such as "Fe is +3 on the tetrahedral sites" has to reach the
+    oxidation search as per-atom constraints, because the element-level search
+    cannot tell the two Fe sublattices apart.
+    """
+    params = getattr(structure, "generation_parameters", None)
+    if params is None or getattr(params, "family", "perovskite") != "spinel":
+        return {}
+    if not params.sublattice_oxidation_states:
+        return {}
+    from quick_mag.spinel_composition import sublattice_oxidation_constraints
+
+    try:
+        return sublattice_oxidation_constraints(structure)
+    except ValueError:
+        # Site roles that no longer line up with the atoms (e.g. a reordered
+        # copy) cannot be trusted; fall back to the unconstrained search.
+        return {}
+
+
+def _solve_with_constraints(structure: ChemicalStructure, args, constraints: dict) -> int:
+    """The ``solve`` pipeline with per-atom oxidation constraints."""
+    labels = structure.element_symbols()
+    ranked = enumerate_site_group_assignments(
+        labels,
+        charge=args.charge,
+        max_mixing=args.max_mixing,
+        constraints=constraints,
+        top_k=max(1, args.top_k),
+    )
+    if not ranked:
+        print("No charge-balanced oxidation-state assignments satisfy the sublattice constraints.")
+        return 1
+    print(
+        f"  Sublattice oxidation constraints on {len(constraints)} atom(s); "
+        f"top {len(ranked)} assignment(s) will be solved."
+    )
+    for group_assignment in ranked:
+        assignments = expand_group_assignments_to_site_assignments(
+            [group_assignment], structure, max_assignments=1
+        )
+        if assignments:
+            _run_assignment(structure, assignments[0], args)
+    return 0
+
+
 def solve_structure(structure: ChemicalStructure, args) -> int:
     """Run the full magnetism pipeline for one structure."""
     labels = structure.element_symbols()
     print(f"Structure: {structure.name}  ({structure.atom_count} atoms)")
     print(f"  elements: {', '.join(sorted(set(labels)))}")
+
+    constraints = _provenance_oxidation_constraints(structure)
+    if constraints:
+        return _solve_with_constraints(structure, args, constraints)
 
     ranked = enumerate_oxidation_states_by_energy(
         labels, charge=args.charge, max_mixing=args.max_mixing, top_k=max(1, args.top_k)

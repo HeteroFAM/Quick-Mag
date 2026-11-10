@@ -283,7 +283,13 @@ def site_indexing_from_generation_parameters(params, build) -> PerovskiteSiteInd
     its place in ``grid_to_site`` as ``-1`` so the grid stays a lattice.
     """
     from quick_mag.defects import resolve_defects
+    from quick_mag.structure import generation_family
 
+    if generation_family(params) != "perovskite":
+        raise ValueError(
+            "site indexing needs a perovskite B-site grid; "
+            f"this structure is a {generation_family(params)}."
+        )
     periodic = params.periodic_axes
     resolution = resolve_defects(
         build,

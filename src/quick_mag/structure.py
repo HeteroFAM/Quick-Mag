@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 
@@ -36,6 +36,12 @@ from quick_mag.perovskite_builder import (
     build_perovskite,
     canonicalize_glazer_tilt_angles_deg,
     periodic_axes,
+)
+from quick_mag.spinel_builder import (
+    DEFAULT_LATTICE_CONSTANT,
+    DEFAULT_U,
+    build_spinel,
+    cell_lattice,
 )
 
 
@@ -75,6 +81,11 @@ class PerovskiteGenerationParameters:
     the structure's atom order. ``ChemicalStructure`` objects loaded from a file
     carry ``generation_parameters=None`` instead.
     """
+
+    # Structure family, for code that handles more than one kind of builder
+    # provenance (see ``generation_family``). A class constant rather than a
+    # field so it never enters the dataclass signature or ``replace``.
+    family: ClassVar[str] = "perovskite"
 
     # --- build_perovskite(...) inputs (deterministic regeneration) ---
     center: np.ndarray
@@ -309,7 +320,10 @@ def generation_parameters_to_json(params: PerovskiteGenerationParameters) -> Dic
     """
     from dataclasses import fields as dataclass_fields
 
-    payload: Dict[str, Any] = {}
+    if generation_family(params) == "spinel":
+        return _spinel_parameters_to_json(params)
+
+    payload: Dict[str, Any] = {"family": "perovskite"}
     for spec in dataclass_fields(params):
         value = getattr(params, spec.name)
         if spec.name == "defects":
@@ -336,9 +350,19 @@ def generation_parameters_to_json(params: PerovskiteGenerationParameters) -> Dic
     return payload
 
 
-def generation_parameters_from_json(payload: Dict[str, Any]) -> PerovskiteGenerationParameters:
-    """Rebuild parameters from :func:`generation_parameters_to_json` output."""
+def generation_parameters_from_json(payload: Dict[str, Any]) -> "GenerationParameters":
+    """Rebuild parameters from :func:`generation_parameters_to_json` output.
+
+    The ``family`` key picks the parameter class; a payload without one predates
+    families and is a perovskite.
+    """
     from dataclasses import fields as dataclass_fields
+
+    family = str(dict(payload).get("family", "perovskite"))
+    if family == "spinel":
+        return _spinel_parameters_from_json(payload)
+    if family != "perovskite":
+        raise ValueError(f"Unknown structure family '{family}' in generation parameters.")
 
     known = {spec.name for spec in dataclass_fields(PerovskiteGenerationParameters)}
     kwargs: Dict[str, Any] = {}
@@ -365,6 +389,205 @@ def generation_parameters_from_json(payload: Dict[str, Any]) -> PerovskiteGenera
         else:
             kwargs[key] = value
     return PerovskiteGenerationParameters(**kwargs)
+
+
+SPINEL_FORMULA_MODES: Tuple[str, ...] = ("spinel", "high_entropy")
+SPINEL_SAMPLING_MODES: Tuple[str, ...] = ("exact", "iid")
+
+
+@dataclass
+class SpinelGenerationParameters:
+    """Provenance for a generated spinel (see :mod:`quick_mag.spinel_builder`).
+
+    Like :class:`PerovskiteGenerationParameters` it stores exactly what is needed
+    to regenerate the structure -- lattice, cell, occupancy rule and sampling
+    seeds -- plus the atom-order mapping from the canonical ``(A, B, X)`` build.
+    ``A`` is the tetrahedral (8a) sublattice, ``B`` the octahedral (16d) one and
+    ``X`` the anions (32e).
+
+    Formula modes:
+
+    * ``"spinel"`` -- ``A B2 X4`` with inversion degree ``inversion`` (0 normal,
+      1 fully inverse ``B[AB]X4``). The ``round(inversion * n_A)`` swapped A/B
+      pairs are drawn from a seeded permutation that does not depend on
+      ``inversion``, so a scan of the inversion degree inverts a growing, nested
+      set of sites.
+    * ``"high_entropy"`` -- independent element mixes per sublattice
+      (``high_entropy_*_sites``). ``sampling="exact"`` places exactly the
+      composition the fractions imply (largest-remainder rounding, then a seeded
+      shuffle); ``"iid"`` draws every site independently, as the perovskite
+      builder does.
+
+    ``sublattice_oxidation_states`` optionally restricts the oxidation states an
+    element may take on one sublattice, e.g. ``{"A": {"Fe": (3,)}, "B": {"Fe":
+    (2, 3)}}`` for magnetite; :func:`quick_mag.spinel_composition.sublattice_oxidation_constraints`
+    turns it into per-atom constraints for the oxidation-state search.
+    """
+
+    family: ClassVar[str] = "spinel"
+
+    # --- geometry (build_spinel inputs) ---
+    a: float = DEFAULT_LATTICE_CONSTANT
+    # None means cubic (c = a).
+    c: Optional[float] = None
+    u: float = DEFAULT_U
+    n_cells: Tuple[int, int, int] = (1, 1, 1)
+    cell: str = "conventional"
+    periodic: bool = True
+    periodic_axes: Optional[Tuple[bool, bool, bool]] = None
+
+    # --- composition ---
+    formula_mode: str = "spinel"
+    a_site_element: str = "Co"
+    b_site_element: str = "Fe"
+    x_site_element: str = "O"
+    inversion: float = 0.0
+    high_entropy_a_sites: List[Tuple[str, float]] = field(
+        default_factory=lambda: [("Co", 1.0)]
+    )
+    high_entropy_b_sites: List[Tuple[str, float]] = field(
+        default_factory=lambda: [("Fe", 1.0)]
+    )
+    high_entropy_x_sites: List[Tuple[str, float]] = field(
+        default_factory=lambda: [("O", 1.0)]
+    )
+    sampling: str = "exact"
+    sample_index: int = 0
+    seed: int = 0
+    sublattice_oxidation_states: Dict[str, Dict[str, Tuple[int, ...]]] = field(
+        default_factory=dict
+    )
+
+    # --- atom-order mapping from canonical build order to structure order ---
+    site_roles: List[str] = field(default_factory=list)
+    permutation: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int64)
+    )
+    source: str = "spinel_builder"
+
+    def __post_init__(self) -> None:
+        self.a = float(self.a)
+        self.c = None if self.c is None else float(self.c)
+        self.u = float(self.u)
+        self.n_cells = tuple(int(value) for value in self.n_cells)  # type: ignore[assignment]
+        self.cell = str(self.cell)
+        self.periodic, self.periodic_axes = _reconcile_periodicity(
+            self.periodic, self.periodic_axes
+        )
+        self.formula_mode = str(self.formula_mode)
+        if self.formula_mode not in SPINEL_FORMULA_MODES:
+            raise ValueError(
+                f"Unknown spinel formula mode '{self.formula_mode}'; expected one of "
+                f"{SPINEL_FORMULA_MODES}."
+            )
+        self.inversion = float(self.inversion)
+        if not 0.0 <= self.inversion <= 1.0:
+            raise ValueError(f"Spinel inversion must lie in [0, 1]; got {self.inversion}.")
+        self.sampling = str(self.sampling)
+        if self.sampling not in SPINEL_SAMPLING_MODES:
+            raise ValueError(
+                f"Unknown sampling mode '{self.sampling}'; expected one of "
+                f"{SPINEL_SAMPLING_MODES}."
+            )
+        self.sample_index = int(self.sample_index)
+        self.seed = int(self.seed)
+        for name in ("high_entropy_a_sites", "high_entropy_b_sites", "high_entropy_x_sites"):
+            setattr(
+                self,
+                name,
+                [(str(element), float(fraction)) for element, fraction in getattr(self, name)],
+            )
+        self.sublattice_oxidation_states = {
+            str(role): {
+                str(element): tuple(sorted({int(state) for state in states}))
+                for element, states in dict(per_element).items()
+            }
+            for role, per_element in dict(self.sublattice_oxidation_states).items()
+        }
+        for role in self.sublattice_oxidation_states:
+            if role not in ("A", "B", "X"):
+                raise ValueError(
+                    f"sublattice_oxidation_states role '{role}' must be A, B, or X."
+                )
+        self.site_roles = list(self.site_roles)
+        self.permutation = np.asarray(self.permutation, dtype=np.int64).reshape(-1)
+
+    def grid_shape(self) -> Tuple[int, int, int]:
+        """Cell repeats of the build, ``(nx, ny, nz)``."""
+        return tuple(int(value) for value in self.n_cells)  # type: ignore[return-value]
+
+    def supercell_lattice(self) -> np.ndarray:
+        """The supercell the build fills (row vectors)."""
+        unit = cell_lattice(self.a, self.c, self.cell)
+        return (np.diag(self.grid_shape()).astype(np.float64) @ unit).astype(np.float64)
+
+    def build_kwargs(self) -> Dict[str, Any]:
+        """Exact keyword arguments for ``build_spinel(...)``."""
+        return dict(
+            a=self.a,
+            c=self.c,
+            u=self.u,
+            n_cells=self.grid_shape(),
+            cell=self.cell,
+            periodic=self.periodic_axes,
+        )
+
+
+# Builder provenance of any family.
+GenerationParameters = Union[PerovskiteGenerationParameters, SpinelGenerationParameters]
+
+
+def generation_family(params) -> str:
+    """``"perovskite"`` or ``"spinel"``; None (no provenance) gives ``""``."""
+    if params is None:
+        return ""
+    return str(getattr(params, "family", "perovskite"))
+
+
+def is_perovskite_provenance(params) -> bool:
+    """True for builder provenance that describes a perovskite grid."""
+    return params is not None and generation_family(params) == "perovskite"
+
+
+def _spinel_parameters_to_json(params: SpinelGenerationParameters) -> Dict[str, Any]:
+    from dataclasses import fields as dataclass_fields
+
+    payload: Dict[str, Any] = {"family": "spinel"}
+    for spec in dataclass_fields(params):
+        value = getattr(params, spec.name)
+        if isinstance(value, np.ndarray):
+            payload[spec.name] = value.tolist()
+        elif isinstance(value, tuple):
+            payload[spec.name] = list(value)
+        elif spec.name.startswith("high_entropy_"):
+            payload[spec.name] = [[str(e), float(f)] for e, f in value]
+        elif spec.name == "sublattice_oxidation_states":
+            payload[spec.name] = {
+                role: {element: list(states) for element, states in per_element.items()}
+                for role, per_element in value.items()
+            }
+        else:
+            payload[spec.name] = value
+    return payload
+
+
+def _spinel_parameters_from_json(payload: Dict[str, Any]) -> SpinelGenerationParameters:
+    from dataclasses import fields as dataclass_fields
+
+    known = {spec.name for spec in dataclass_fields(SpinelGenerationParameters)}
+    kwargs: Dict[str, Any] = {}
+    for key, value in dict(payload).items():
+        if key not in known:
+            continue
+        if key == "periodic_axes" and isinstance(value, list):
+            kwargs[key] = tuple(bool(flag) for flag in value)
+        elif key == "n_cells":
+            kwargs[key] = tuple(int(v) for v in value)
+        elif key.startswith("high_entropy_") and isinstance(value, list):
+            kwargs[key] = [(str(e), float(f)) for e, f in value]
+        else:
+            kwargs[key] = value
+    return SpinelGenerationParameters(**kwargs)
 
 
 def _reconcile_periodicity(periodic, axes) -> Tuple[bool, Tuple[bool, bool, bool]]:
@@ -441,7 +664,7 @@ class ChemicalStructure:
     # ``(True, True, False)`` with ``is_periodic`` True. ``neighbors`` only
     # enumerates images along the periodic axes.
     periodic_axes: Optional[Tuple[bool, bool, bool]] = None
-    generation_parameters: Optional[PerovskiteGenerationParameters] = None
+    generation_parameters: Optional["GenerationParameters"] = None
     # Whether ``lattice`` and ``cartesian_coords`` are still exactly what
     # ``generation_parameters`` rebuilds.
     #
@@ -622,7 +845,7 @@ class ChemicalStructure:
         cartesian_coords: np.ndarray,
         atomic_labels: List[str],
         is_periodic=True,
-        generation_parameters: Optional[PerovskiteGenerationParameters] = None,
+        generation_parameters: Optional["GenerationParameters"] = None,
         geometry_matches_generation: bool = True,
         periodic_axes: Optional[Tuple[bool, bool, bool]] = None,
     ) -> "ChemicalStructure":
@@ -640,14 +863,18 @@ class ChemicalStructure:
         )
 
 
-def build_from_generation_parameters(params: PerovskiteGenerationParameters):
-    """Deterministically reconstruct the canonical ``PerovskiteBuild``.
+def build_from_generation_parameters(params: "GenerationParameters"):
+    """Deterministically reconstruct the canonical build the parameters describe.
 
-    The returned build is in canonical, fully-occupied (A, B, X) order, identical
-    to the one originally produced during generation. To express its site indices
-    in a structure's (possibly shuffled, vacancy-reduced) atom order, pair this
-    with ``site_indexing_from_generation_parameters`` in ``classify_spin_structure``.
+    For a perovskite this is the ``PerovskiteBuild`` in canonical, fully-occupied
+    (A, B, X) order, identical to the one originally produced during generation.
+    To express its site indices in a structure's (possibly shuffled,
+    vacancy-reduced) atom order, pair this with
+    ``site_indexing_from_generation_parameters`` in ``classify_spin_structure``.
+    For a spinel it is the :class:`~quick_mag.spinel_builder.SpinelBuild`.
     """
+    if generation_family(params) == "spinel":
+        return build_spinel(**params.build_kwargs())
     return build_perovskite(**params.build_kwargs())
 
 

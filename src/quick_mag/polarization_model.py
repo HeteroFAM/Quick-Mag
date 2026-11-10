@@ -25,11 +25,13 @@ moments.
 
 Orbital resolution: ``mbar_a`` is the per-orbital net unpaired spin from the Hund
 shell filling (t2g H/3 on each t2g orbital, eg H/2 on each eg orbital), evaluated
-in each site's own octahedral frame (``local_octahedral_frame``). This equals the
+in each site's own local frame (``local_d_frame``: the octahedral axes, or for a
+tetrahedral site the axes of the cube its ligands sit on, where the filling order
+of the two orbital sets is inverted -- see ``ion_descriptors``). This equals the
 average over degenerate microstates, since J is bilinear in the occupancies. For
-eg^1 sites the shell average is replaced by the *coherent* eg orbital selected by
-a point-charge crystal field (``crystal_field_eg_orbital``), which also opens the
-occupied->empty FM channel of ``bridge_J_components``.
+octahedral eg^1 sites the shell average is replaced by the *coherent* eg orbital
+selected by a point-charge crystal field (``crystal_field_eg_orbital``), which
+also opens the occupied->empty FM channel of ``bridge_J_components``.
 """
 
 from __future__ import annotations
@@ -43,7 +45,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from quick_mag.ion_descriptors import IonDescriptor, ion_descriptor, ANION_SPECIES
+from quick_mag.ion_descriptors import (
+    ANION_SPECIES,
+    IonDescriptor,
+    ion_descriptor,
+    site_ligand_directions,
+)
 from quick_mag.oxidation_state_energy import min_energies_with_single_valence
 from quick_mag.radii import SHANNON_IONIC_RADII
 import quick_mag.sk_table as sk_table
@@ -55,6 +62,9 @@ ANION_CHARGES: Dict[str, int] = {
     "O": -2, "S": -2, "Se": -2, "Te": -2, "N": -3,
     "F": -1, "Cl": -1, "Br": -1, "I": -1,
 }
+
+# IonDescriptor.coordination -> Shannon table coordination label.
+_SHANNON_COORDINATION = {"oct": "VI", "tet": "IV"}
 
 # IonDescriptor.spin_state -> Shannon table spin-state label.
 _SHANNON_SPIN_LABEL = {"HS": "High Spin", "LS": "Low Spin"}
@@ -280,14 +290,66 @@ def local_octahedral_frame(
     return (u_svd @ vt).T
 
 
+def local_tetrahedral_frame(
+    structure,
+    site_index: int,
+    *,
+    ligand_cutoff: float = 3.0,
+) -> np.ndarray:
+    """Local cubic d-frame of a tetrahedral site from its four ligands.
+
+    A tetrahedron's ligands sit on alternate corners of a cube, and the cube's
+    axes are the frame in which (dz2, dx2-y2) form the e level and (dxy, dxz,
+    dyz) the t2 level. Each of the three ways of splitting the four ligands into
+    two pairs gives one axis, ``(u_a + u_b) - (u_c + u_d)`` (exactly a cube axis
+    for an ideal tetrahedron); the three are symmetrized to the nearest
+    orthonormal set by polar decomposition. Returns the rotation whose *columns*
+    are the local axes in global coordinates, like ``local_octahedral_frame``.
+    Axis labels and signs are arbitrary, which the shell-averaged occupancies do
+    not see. Falls back to the identity when the site does not have exactly four
+    ligands.
+    """
+    directions = site_ligand_directions(structure, site_index, ligand_cutoff=ligand_cutoff)
+    if len(directions) != 4:
+        return np.eye(3)
+    u = directions
+    axes = np.array(
+        [
+            (u[0] + u[1]) - (u[2] + u[3]),
+            (u[0] + u[2]) - (u[1] + u[3]),
+            (u[0] + u[3]) - (u[1] + u[2]),
+        ]
+    )
+    norms = np.linalg.norm(axes, axis=1)
+    if np.any(norms < 1e-8):
+        return np.eye(3)
+    axes = axes / norms[:, None]
+    u_svd, _, vt = np.linalg.svd(axes)
+    return (u_svd @ vt).T
+
+
+def local_d_frame(
+    structure,
+    site_index: int,
+    coordination: str = "oct",
+    *,
+    ligand_cutoff: float = 3.0,
+) -> np.ndarray:
+    """The site's local d-orbital frame for its coordination (see ``IonDescriptor``)."""
+    if coordination == "tet":
+        return local_tetrahedral_frame(structure, site_index, ligand_cutoff=ligand_cutoff)
+    return local_octahedral_frame(structure, site_index, ligand_cutoff=ligand_cutoff)
+
+
 def is_eg_active(descriptor: IonDescriptor) -> bool:
     """True when the eg shell is singly occupied or singly holed (orbital freedom).
 
     ``n_eg in {1, 3}`` — one eg electron (e.g. Mn3+ d4 HS) or one eg hole (d9) —
     is the Jahn-Teller / orbital-ordering case. ``n_eg`` of 0 (empty) or 2 (full)
-    has no eg orbital degree of freedom.
+    has no eg orbital degree of freedom. Octahedral sites only: the
+    crystal-field orbital selection behind it is an octahedral construction.
     """
-    return descriptor.n_eg in (1, 3)
+    return descriptor.coordination == "oct" and descriptor.n_eg in (1, 3)
 
 
 def is_occ_empty_active(descriptor: IonDescriptor) -> bool:
@@ -298,9 +360,9 @@ def is_occ_empty_active(descriptor: IonDescriptor) -> bool:
     neighbour's empty eg orbital then lowers energy for parallel spins -> FM.
     Excludes eg^3 (a lone hole; filling it leaves no other unpaired spin, so no
     Hund bonus — the FM channel is not electron-hole symmetric; see
-    docs/theory/magnetism-model.md).
+    docs/theory/magnetism-model.md). Octahedral sites only, like ``is_eg_active``.
     """
-    return descriptor.n_eg == 1
+    return descriptor.coordination == "oct" and descriptor.n_eg == 1
 
 
 def eg_orbital_director(
@@ -429,14 +491,17 @@ def coherent_eg_intensity(
 
 @lru_cache(maxsize=None)
 def _shannon_crystal_radius(
-    element: str, charge: int, spin_label: Optional[str]
+    element: str, charge: int, spin_label: Optional[str], coordination: str = "VI"
 ) -> float:
-    """Mean Shannon crystal radius with fallback: exact (VI, spin) -> (VI) ->
-    any coordination at that charge -> any entry for the element."""
+    """Mean Shannon crystal radius with fallback: exact (coordination, spin) ->
+    (coordination) -> any coordination at that charge -> any entry for the element.
+
+    ``coordination`` is the Shannon label: "VI" for octahedral, "IV" for
+    tetrahedral sites."""
     entry = SHANNON_IONIC_RADII[element]
     for kwargs in (
-        {"charge": charge, "coordination": "VI", "spin_state": spin_label},
-        {"charge": charge, "coordination": "VI"},
+        {"charge": charge, "coordination": coordination, "spin_state": spin_label},
+        {"charge": charge, "coordination": coordination},
         {"charge": charge},
         {},
     ):
@@ -447,11 +512,22 @@ def _shannon_crystal_radius(
 
 
 def r0_metal_ligand(
-    metal: str, oxidation_state: int, spin_state: str, ligand: str
+    metal: str,
+    oxidation_state: int,
+    spin_state: str,
+    ligand: str,
+    coordination: str = "oct",
 ) -> float:
-    """Reference M-L bond length: sum of Shannon crystal radii (Angstrom)."""
+    """Reference M-L bond length: sum of Shannon crystal radii (Angstrom).
+
+    The metal radius is the one for its ``coordination`` ("oct" -> VI,
+    "tet" -> IV); the ligand radius is the tabulated anion radius as before.
+    """
     metal_radius = _shannon_crystal_radius(
-        metal, int(oxidation_state), _SHANNON_SPIN_LABEL.get(spin_state.upper())
+        metal,
+        int(oxidation_state),
+        _SHANNON_SPIN_LABEL.get(spin_state.upper()),
+        _SHANNON_COORDINATION.get(coordination, "VI"),
     )
     ligand_radius = _shannon_crystal_radius(ligand, ANION_CHARGES.get(ligand, -2), None)
     return metal_radius + ligand_radius
@@ -463,6 +539,7 @@ def r0_metal_ligand_averaged(
     states: Tuple[Tuple[int, float], ...],
     spin_state: str,
     ligand: str,
+    coordination: str = "oct",
 ) -> float:
     """Reference M-L bond length averaged over the states the metal is found in.
 
@@ -478,7 +555,7 @@ def r0_metal_ligand_averaged(
     A single-state element reproduces ``r0_metal_ligand`` exactly.
     """
     return sum(
-        weight * r0_metal_ligand(metal, state, spin_state, ligand)
+        weight * r0_metal_ligand(metal, state, spin_state, ligand, coordination)
         for state, weight in states
     )
 
@@ -508,6 +585,56 @@ def element_oxidation_fractions(
         )
         for element, per_element in counts.items()
     }
+
+
+def site_class_oxidation_fractions(
+    descriptors: Dict[int, IonDescriptor],
+) -> Dict[Tuple[str, str], Tuple[Tuple[int, float], ...]]:
+    """``element_oxidation_fractions`` resolved by coordination as well as element.
+
+    Keyed by ``(element, coordination)``. Within one such class which site
+    carries which valence is still arbitrary, but across classes it is not: in
+    magnetite the tetrahedral Fe are Fe3+ and only the octahedral ones are
+    mixed-valent. A structure whose sites of an element share one coordination
+    (every perovskite) gets exactly the per-element fractions.
+    """
+    counts: Dict[Tuple[str, str], Dict[int, int]] = {}
+    for descriptor in descriptors.values():
+        per_class = counts.setdefault((descriptor.element, descriptor.coordination), {})
+        state = int(descriptor.oxidation_state)
+        per_class[state] = per_class.get(state, 0) + 1
+    return {
+        key: tuple(
+            (state, per_class[state] / float(sum(per_class.values())))
+            for state in sorted(per_class)
+        )
+        for key, per_class in counts.items()
+    }
+
+
+def _site_class(descriptor: IonDescriptor) -> Tuple[str, str]:
+    return descriptor.element, descriptor.coordination
+
+
+def _de_resonance_weight(
+    states_i: Tuple[Tuple[int, float], ...],
+    states_j: Tuple[Tuple[int, float], ...],
+) -> float:
+    """Weight of the valence combinations a carrier can resonate between.
+
+    ``sum_{a != b} sqrt(p_a q_b p_b q_a)``: the configuration ``(i^a, j^b)`` and
+    its hopped partner ``(i^b, j^a)`` must both occur. Equals ``1 - sum_a p_a^2``
+    when ``p == q``, the original same-element weight.
+    """
+    p = dict(states_i)
+    q = dict(states_j)
+    states = sorted(set(p) | set(q))
+    total = 0.0
+    for a in states:
+        for b in states:
+            if a != b:
+                total += math.sqrt(p.get(a, 0.0) * q.get(b, 0.0) * p.get(b, 0.0) * q.get(a, 0.0))
+    return float(total)
 
 
 def occupancy_vector(descriptor: IonDescriptor) -> np.ndarray:
@@ -620,8 +747,9 @@ def build_bridges(
     image-resolved M-L unit vectors, precomputing the channel intensities. A metal
     pair sharing several ligands (edge/face sharing) yields one bridge per ligand.
 
-    Each site's d orbitals are evaluated in its own octahedral frame
-    (``local_octahedral_frame``), so tilted octahedra keep their eg/t2g character.
+    Each site's d orbitals are evaluated in its own local frame (``local_d_frame``),
+    so tilted octahedra keep their eg/t2g character and tetrahedral sites their
+    e/t2 character.
 
     ``de_pairs`` overrides the charge-balance double-exchange gate. When
     None it is computed via ``de_active_pairs``.
@@ -633,15 +761,22 @@ def build_bridges(
     # states. Every channel is a product of one factor per end, so that double sum
     # factorizes exactly into the per-end sums built here -- no combination loop and
     # no approximation. A single-valent element leaves everything unchanged.
-    fractions = element_oxidation_fractions(descriptors)
+    #
+    # "Its element" is resolved by coordination too (``site_class_oxidation_fractions``):
+    # tetrahedral and octahedral sites of one element are not interchangeable.
+    fractions = site_class_oxidation_fractions(descriptors)
     rotations: Dict[int, np.ndarray] = {
-        site: local_octahedral_frame(structure, site, ligand_cutoff=anion_bond_cutoff)
-        for site in descriptors
+        site: local_d_frame(
+            structure, site, descriptor.coordination, ligand_cutoff=anion_bond_cutoff
+        )
+        for site, descriptor in descriptors.items()
     }
-    state_descriptors: Dict[Tuple[str, int, str], IonDescriptor] = {}
+    state_descriptors: Dict[Tuple[str, int, str, str], IonDescriptor] = {}
     for descriptor in descriptors.values():
-        for state, _weight in fractions[descriptor.element]:
-            key = (descriptor.element, state, descriptor.spin_state)
+        for state, _weight in fractions[_site_class(descriptor)]:
+            key = (
+                descriptor.element, state, descriptor.spin_state, descriptor.coordination
+            )
             if key not in state_descriptors:
                 state_descriptors[key] = ion_descriptor(*key)
 
@@ -657,9 +792,9 @@ def build_bridges(
     for site, descriptor in descriptors.items():
         alternatives = [
             (weight, state_descriptors[
-                (descriptor.element, state, descriptor.spin_state)
+                (descriptor.element, state, descriptor.spin_state, descriptor.coordination)
             ])
-            for state, weight in fractions[descriptor.element]
+            for state, weight in fractions[_site_class(descriptor)]
         ]
         ev = None
         if any(is_occ_empty_active(alt) for _weight, alt in alternatives):
@@ -753,17 +888,23 @@ def build_bridges(
                 desc_j = descriptors[nbr_j.index]
                 ligand = symbols[ligand_index]
                 de_active = frozenset((desc_i.element, desc_j.element)) in de_pairs
-                # A carrier can only hop between ends of *different* valence, so a
-                # same-element pair carries DE on the mixed combinations alone:
-                # 1 - sum_a p_a^2, the chance the two ends differ. (A cross-element
+                # A carrier can only hop between ends of *different* valence, and
+                # the hop needs both the configuration it leaves and the one it
+                # makes: (i^a, j^b) <-> (i^b, j^a). With p and q the state
+                # fractions of the two ends' site classes, the weight is
+                # sum_{a != b} sqrt(p_a q_b * p_b q_a); for two ends of one class
+                # that is 1 - sum_a p_a^2, the chance the two ends differ. Across
+                # classes it vanishes when either end is single-valent -- magnetite's
+                # tetrahedral Fe3+ do not join the octahedral Fe2+/Fe3+ hopping.
+                # (A cross-element
                 # resonant pair keeps full weight -- "differing valence" says nothing
                 # across two elements.) An element the composition forces mixed but
                 # whose sites have all been overridden to one state drops to zero,
                 # which is the right answer for the structure as it now stands.
                 de_weight = 1.0
                 if de_active and desc_i.element == desc_j.element:
-                    de_weight = 1.0 - sum(
-                        weight * weight for _state, weight in fractions[desc_i.element]
+                    de_weight = _de_resonance_weight(
+                        fractions[_site_class(desc_i)], fractions[_site_class(desc_j)]
                     )
                 bridges.append(
                     BridgeGeometry(
@@ -777,15 +918,17 @@ def build_bridges(
                         r_jL=r_j,
                         R0_iL=r0_metal_ligand_averaged(
                             desc_i.element,
-                            fractions[desc_i.element],
+                            fractions[_site_class(desc_i)],
                             desc_i.spin_state,
                             ligand,
+                            desc_i.coordination,
                         ),
                         R0_jL=r0_metal_ligand_averaged(
                             desc_j.element,
-                            fractions[desc_j.element],
+                            fractions[_site_class(desc_j)],
                             desc_j.spin_state,
                             ligand,
+                            desc_j.coordination,
                         ),
                         Bsig_i=bsig_i,
                         Bpi_i=bpi_i,

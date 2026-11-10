@@ -4,6 +4,8 @@ Subcommands:
   * ``quick-mag build ...`` — build perovskite structures (with structural scans
     and element combinations) and write them as CIFs (see
     :mod:`quick_mag.build_cli`).
+  * ``quick-mag build-spinel ...`` — build normal, inverse, and high-entropy
+    spinels (see :mod:`quick_mag.spinel_build_cli`).
   * ``quick-mag chgnet STRUCTURE ...`` — CHGNet single-point energies and geometry
     optimizations (see :mod:`quick_mag.chgnet_cli`; requires the optional
     ``chgnet`` extra: ``pip install -e '.[chgnet]'``).
@@ -20,8 +22,8 @@ memory instead of through files::
     quick-mag build --a-site La --b-site Mn :: chgnet :: solve
 
 Only the last stage writes to disk, unless a stage is given an explicit ``-o``.
-``solve`` must be last (its spin data feeds nothing else) and ``build`` must be
-first (it consumes no structures).
+``solve`` must be last (its spin data feeds nothing else) and ``build`` /
+``build-spinel`` must be first (they consume no structures).
 """
 
 from __future__ import annotations
@@ -35,6 +37,12 @@ from quick_mag.build_cli import (
     build_structures,
     configure_build_parser,
     report_build,
+)
+from quick_mag.spinel_build_cli import (
+    SPINEL_BUILD_DESCRIPTION,
+    build_spinel_structures,
+    configure_spinel_build_parser,
+    report_spinel_build,
 )
 from quick_mag.magnetic_cli import (
     SOLVE_DESCRIPTION,
@@ -50,6 +58,7 @@ CHAIN_TOKEN = "::"
 # consumes spin configurations, and ``ui`` is interactive so it never chains.
 _ALLOWED_SUCCESSORS = {
     "build": {"chgnet", "solve"},
+    "build-spinel": {"chgnet", "solve"},
     "chgnet": {"chgnet", "solve"},
     "solve": set(),
     "ui": set(),
@@ -59,6 +68,9 @@ _ALLOWED_SUCCESSORS = {
 # Stages that are long-running and interactive rather than structure transforms.
 # They consume nothing and produce nothing, so they can never appear in a chain.
 _STANDALONE_STAGES = ("ui", "serve")
+
+# Stages that generate structures rather than consume them.
+_BUILDER_STAGES = ("build", "build-spinel")
 
 
 def _launch_ui(_args, **_kwargs) -> int:
@@ -148,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     configure_build_parser(build_parser_)
     build_parser_.set_defaults(stage="build")
 
+    spinel_parser = subparsers.add_parser(
+        "build-spinel",
+        help="Build spinel structures (normal, inverse, high-entropy).",
+        description=SPINEL_BUILD_DESCRIPTION,
+    )
+    configure_spinel_build_parser(spinel_parser)
+    spinel_parser.set_defaults(stage="build-spinel")
+
     chgnet_parser = subparsers.add_parser(
         "chgnet", help="CHGNet single-point energies and geometry optimizations.",
     )
@@ -211,9 +231,9 @@ def validate_chain(stages: List[argparse.Namespace]) -> None:
                 f"'{name}' runs on its own and cannot be part of a "
                 f"'{CHAIN_TOKEN}' chain."
             )
-        if name == "build" and not first:
+        if name in _BUILDER_STAGES and not first:
             raise ValueError(
-                "'build' generates its own structures, so it can only be the "
+                f"'{name}' generates its own structures, so it can only be the "
                 f"first stage of a '{CHAIN_TOKEN}' chain."
             )
         if not last and stages[index + 1].stage not in _ALLOWED_SUCCESSORS[name]:
@@ -243,6 +263,9 @@ def run_chain(stages: List[argparse.Namespace]) -> int:
         if args.stage == "build":
             structures = build_structures(args)
             report_build(args, structures, write=last)
+        elif args.stage == "build-spinel":
+            structures = build_spinel_structures(args)
+            report_spinel_build(args, structures, write=last)
         elif args.stage == "chgnet":
             structures = _run_chgnet(args, structures, write=last)
         elif args.stage == "solve":

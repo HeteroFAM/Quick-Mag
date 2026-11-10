@@ -186,6 +186,11 @@ def base_parameters(structure: ChemicalStructure) -> PerovskiteGenerationParamet
     params = structure.generation_parameters
     if params is None:
         raise ValueError("only a structure with builder provenance can be reconstructed.")
+    if getattr(params, "family", "perovskite") != "perovskite":
+        raise ValueError(
+            "reconstruction fits a perovskite octahedral grid; "
+            f"'{structure.name}' is a {params.family}, which is not supported yet."
+        )
     lengths = np.linalg.norm(np.asarray(structure.lattice, dtype=np.float64), axis=1)
     ideal_lengths = np.linalg.norm(params.supercell_lattice(), axis=1)
     scale = np.where(ideal_lengths > 0.0, lengths / np.where(ideal_lengths > 0.0, ideal_lengths, 1.0), 1.0)

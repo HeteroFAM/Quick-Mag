@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -28,9 +28,14 @@ from quick_mag.perovskite_builder import (
     canonical_site_keys,
     periodic_axes,
 )
+from quick_mag.spinel_builder import (
+    DEFAULT_LATTICE_CONSTANT as DEFAULT_SPINEL_LATTICE_CONSTANT,
+    DEFAULT_U as DEFAULT_SPINEL_U,
+)
 from quick_mag.structure import (
     ChemicalStructure,
     PerovskiteGenerationParameters,
+    SpinelGenerationParameters,
     build_from_generation_parameters,
 )
 
@@ -731,3 +736,168 @@ def generate_high_entropy_perovskite(
         high_entropy_sample_index=int(sample_index),
         high_entropy_seed=int(seed),
     )
+
+
+# ---------------------------------------------------------------------------
+# Spinels
+#
+# The spinel counterpart of the perovskite builders above: a structure is a pure
+# function of its SpinelGenerationParameters (see quick_mag.spinel_builder for
+# the lattice and quick_mag.spinel_composition for the occupancy rules).
+# ``a``/``c`` are the conventional cubic (tetragonal) edge lengths in Angstrom
+# and ``u`` is the origin-choice-2 anion parameter (ideal 0.25).
+# ---------------------------------------------------------------------------
+
+
+def spinel_structure_from_parameters(
+    params: SpinelGenerationParameters,
+    *,
+    name: str,
+) -> ChemicalStructure:
+    """Build the spinel ``params`` describes, carrying ``params`` as provenance."""
+    from quick_mag.spinel_composition import spinel_atomic_labels
+
+    build = build_from_generation_parameters(params)
+    labels = spinel_atomic_labels(build, params)
+    site_roles = build.site_roles
+    params_for_build = replace(
+        params,
+        site_roles=site_roles,
+        permutation=np.arange(len(site_roles), dtype=np.int64),
+    )
+    return ChemicalStructure.with_zero_magnetic_moments(
+        name=name,
+        lattice=build.lattice,
+        cartesian_coords=build.all_sites,
+        atomic_labels=labels,
+        is_periodic=params.periodic_axes,
+        generation_parameters=params_for_build,
+    )
+
+
+def generate_spinel(
+    name: str,
+    *,
+    a_site: str,
+    b_site: str,
+    x_site: str = "O",
+    a: float = DEFAULT_SPINEL_LATTICE_CONSTANT,
+    c: float | None = None,
+    u: float = DEFAULT_SPINEL_U,
+    inversion: float = 0.0,
+    n_cells_x: int = 1,
+    n_cells_y: int = 1,
+    n_cells_z: int = 1,
+    cell: str = "conventional",
+    sample_index: int = 0,
+    seed: int = 0,
+    sublattice_oxidation_states: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
+) -> ChemicalStructure:
+    """Build an ``A B2 X4`` spinel with inversion degree ``inversion``.
+
+    ``a_site`` is the nominally tetrahedral cation and ``b_site`` the nominally
+    octahedral one; ``inversion`` (0..1) moves ``round(inversion * n_A)`` of the
+    A cations onto octahedral sites in exchange for as many B cations, giving
+    ``(A_{1-x} B_x)[A_x B_{2-x}] X4``. Which sites swap is a seeded,
+    reproducible draw (``sample_index`` and ``seed`` as for high-entropy
+    builds), nested across inversion degrees.
+    """
+    params = SpinelGenerationParameters(
+        a=a,
+        c=c,
+        u=u,
+        n_cells=(n_cells_x, n_cells_y, n_cells_z),
+        cell=cell,
+        formula_mode="spinel",
+        a_site_element=a_site,
+        b_site_element=b_site,
+        x_site_element=x_site,
+        inversion=inversion,
+        sample_index=sample_index,
+        seed=seed,
+        sublattice_oxidation_states=dict(sublattice_oxidation_states or {}),
+    )
+    return spinel_structure_from_parameters(params, name=name)
+
+
+def generate_normal_spinel(name: str, **kwargs) -> ChemicalStructure:
+    """``A[B2]X4`` with every A cation tetrahedral (see :func:`generate_spinel`)."""
+    return generate_spinel(name, inversion=0.0, **kwargs)
+
+
+def generate_inverse_spinel(name: str, **kwargs) -> ChemicalStructure:
+    """``B[AB]X4``: the tetrahedral sites all hold B, the A cations sit octahedral.
+
+    The octahedral A/B arrangement is a seeded random draw; see
+    :func:`generate_spinel`.
+    """
+    return generate_spinel(name, inversion=1.0, **kwargs)
+
+
+def generate_high_entropy_spinel(
+    name: str,
+    *,
+    a_sites: list[tuple[str, float]] | None = None,
+    b_sites: list[tuple[str, float]] | None = None,
+    x_sites: list[tuple[str, float]] | None = None,
+    cations: list[tuple[str, float]] | None = None,
+    site_preferences: Mapping[str, object] | None = None,
+    temperature: float = 1273.15,
+    a: float = DEFAULT_SPINEL_LATTICE_CONSTANT,
+    c: float | None = None,
+    u: float = DEFAULT_SPINEL_U,
+    n_cells_x: int = 1,
+    n_cells_y: int = 1,
+    n_cells_z: int = 1,
+    cell: str = "conventional",
+    sampling: str = "exact",
+    sample_index: int = 0,
+    seed: int = 0,
+    sublattice_oxidation_states: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
+) -> ChemicalStructure:
+    """Build a high-entropy spinel from per-sublattice ``(element, fraction)`` mixes.
+
+    Give the sublattices directly with ``a_sites`` (tetrahedral) and ``b_sites``
+    (octahedral), or give one ``cations`` pool plus ``site_preferences`` and let
+    :func:`quick_mag.spinel_composition.distribute_cations` split it -- e.g.
+    ``cations=[("Co", 1), ("Cr", 1), ("Fe", 1), ("Mn", 1), ("Ni", 1)]`` with
+    ``site_preferences={"Cr": "oct"}``. ``x_sites`` defaults to oxygen.
+
+    ``sampling="exact"`` (default) places the composition the fractions imply,
+    rounded to whole atoms; ``"iid"`` draws each site independently.
+    ``sample_index`` selects the realization and ``seed`` the family of
+    realizations, as for :func:`generate_high_entropy_perovskite`.
+    """
+    from quick_mag.spinel_composition import distribute_cations
+
+    if cations is not None:
+        if a_sites is not None or b_sites is not None:
+            raise ValueError("Pass either a cation pool or explicit a_sites/b_sites, not both.")
+        distribution = distribute_cations(
+            cations, site_preferences, temperature=temperature
+        )
+        a_sites, b_sites = distribution.a_sites, distribution.b_sites
+    elif site_preferences:
+        raise ValueError("site_preferences only applies together with a cation pool.")
+    if a_sites is None or b_sites is None:
+        raise ValueError("A high-entropy spinel needs a_sites and b_sites, or a cation pool.")
+
+    params = SpinelGenerationParameters(
+        a=a,
+        c=c,
+        u=u,
+        n_cells=(n_cells_x, n_cells_y, n_cells_z),
+        cell=cell,
+        formula_mode="high_entropy",
+        a_site_element=a_sites[0][0],
+        b_site_element=b_sites[0][0],
+        x_site_element=(x_sites or [("O", 1.0)])[0][0],
+        high_entropy_a_sites=list(a_sites),
+        high_entropy_b_sites=list(b_sites),
+        high_entropy_x_sites=list(x_sites or [("O", 1.0)]),
+        sampling=sampling,
+        sample_index=sample_index,
+        seed=seed,
+        sublattice_oxidation_states=dict(sublattice_oxidation_states or {}),
+    )
+    return spinel_structure_from_parameters(params, name=name)

@@ -309,6 +309,12 @@ def check_structure_against_params(
                 "to reconstruct it against. Only structures built by the builder "
                 "(and relaxed from it) can be reconstructed."
             )
+        family = getattr(structure.generation_parameters, "family", "perovskite")
+        if family != "perovskite":
+            raise ProtocolError(
+                f"'{structure.name}' is a {family}; reconstruction only supports "
+                "perovskites so far."
+            )
         return
     if params["calculation"] in ("cell", "cell+atoms") and not structure.is_periodic:
         raise ProtocolError(

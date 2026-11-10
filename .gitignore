@@ -27,3 +27,5 @@ public/
 # Regenerable data artifact (precomputed lookup table; not loaded at runtime).
 # Rebuild with: python scripts/enumerate_spin_classifications.py
 data
+
+Claude outputs
