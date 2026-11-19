@@ -2,13 +2,15 @@
 
 Each metal i polarizes the p channels of a bridging ligand L with intensity
 
-    mu_{i->L,p} = kappa_i * f_iL(r) * sum_a mbar_{i,a} * W_{a,p}
+    mu_{i->L,p} = sum_a mbar_{i,a} * [a_sigma,i d_sigma(r) W^sigma_{a,p} + gamma_pi^2 a_pi,i d_pi(r) W^pi_{a,p}]
 
 where ``W`` are squared Slater-Koster pd channel weights (``sk_table``) evaluated
 in a bridge-adapted orthonormal p frame, ``mbar_{i,a}`` is the shell-averaged net
-unpaired spin per d orbital, and ``f_iL(r) = exp(-alpha_iL (r - R0_iL))`` is a
-metal-ligand damping with ``alpha_iL = sqrt(alpha_metal * alpha_ligand)`` and
-``R0_iL`` the sum of Shannon crystal radii (not fit).
+unpaired spin per d orbital, ``d_m(r)`` the metal-ligand range factor of each channel
+(``PolarizationParameters.range_model``; 1 at ``R0_iL``, the sum of Shannon crystal radii),
+and ``a_m,i = exp(theta_m . phi(ion i))`` the ion's amplitude from its atomic descriptors
+(``amplitude_head``). There is no per-element amplitude: the overall scale of the
+polarization lives in the ligand's ``w_L`` and ``J_H^L``.
 
 The ligand's net per-channel polarization for a collinear configuration is
 ``P_p = sigma_i mu_{i,p} + sigma_j mu_{j,p}`` (sigma = +-1). A Pauli cost
@@ -83,12 +85,11 @@ class PolarizationParameters:
     """Fit parameters of the polarization model.
 
     ``alpha`` holds per-element damping exponents for metals AND ligands;
-    ``w_ligand`` is the ligand Pauli stiffness (gauge: w_O pinned to 1 by the
-    fit); ``jh_ligand`` the ligand Hund coupling; ``gamma_pi`` a global pi/sigma
+    ``w_ligand`` is the ligand Pauli stiffness (it carries the overall scale: the
+    metal amplitudes are 1 for a reference ion); ``jh_ligand`` the ligand Hund coupling; ``gamma_pi`` a global pi/sigma
     polarization amplitude ratio (1.0 = no hierarchy).
     """
 
-    kappa: Dict[str, float] = field(default_factory=dict)
     alpha: Dict[str, float] = field(default_factory=dict)
     w_ligand: Dict[str, float] = field(default_factory=dict)
     jh_ligand: Dict[str, float] = field(default_factory=dict)
@@ -105,15 +106,31 @@ class PolarizationParameters:
     # Default 0 = channel off.
     j_fm: Dict[str, float] = field(default_factory=dict)
     gamma_pi: float = 1.0
-    kappa_default: float = 0.1
+    # Range model: how a metal's polarization of a ligand falls with the M-L distance r (it
+    # is the squared M-L transfer, so 1 at the reference
+    # distance R0 = the sum of Shannon crystal radii):
+    #   "exp"    exp(-sqrt(alpha_M alpha_L) (r - R0))           (the original model; alpha fitted)
+    #   "power"  (R0 / r)^n_M, n from ``range_power`` (Harrison's universal pd transfer
+    #            t ~ r^-7/2 gives n = 7 for t^2)
+    #   "sto"    (S_m(r) / S_m(R0))^2 per channel m = sigma, pi: overlaps of the metal-d and
+    #            ligand-p Slater-type orbitals, exponents from Slater's rules for each ion
+    #            (``radial_overlap``) -- frozen, nothing fitted
+    range_model: str = "sto"
+    range_power: Dict[str, float] = field(default_factory=dict)
+    range_power_default: float = 7.0
+    # Per-site amplitude head (``amplitude_head``): {feature: theta} for the sigma and pi amplitudes of an
+    # end, a = exp(theta . phi(ion)). Empty = no head.
+    head_sigma: Dict[str, float] = field(default_factory=dict)
+    head_pi: Dict[str, float] = field(default_factory=dict)
     alpha_default: float = 2.0
-    w_default: float = 1.0
-    jh_default: float = 0.1
+    w_default: float = 0.03
+    jh_default: float = 0.01
     t_de_default: float = 0.0
     j_fm_default: float = 0.0
-
-    def get_kappa(self, element: str) -> float:
-        return self.kappa.get(element, self.kappa_default)
+    # Direct d-d exchange (``direct_exchange``): J_dd = k_dd * G over metal pairs closer than dd_cutoff
+    # (Angstrom), G from Slater-type d-d overlaps. 0 = off.
+    k_dd: float = 0.0
+    dd_cutoff: float = 3.6
 
     def get_alpha(self, element: str) -> float:
         return self.alpha.get(element, self.alpha_default)
@@ -129,6 +146,9 @@ class PolarizationParameters:
 
     def get_j_fm(self, element: str) -> float:
         return self.j_fm.get(element, self.j_fm_default)
+
+    def get_range_power(self, element: str) -> float:
+        return self.range_power.get(element, self.range_power_default)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +381,9 @@ def is_occ_empty_active(descriptor: IonDescriptor) -> bool:
     Excludes eg^3 (a lone hole; filling it leaves no other unpaired spin, so no
     Hund bonus — the FM channel is not electron-hole symmetric; see
     docs/theory/magnetism-model.md). Octahedral sites only, like ``is_eg_active``.
+
+    This is the *coherent* acceptor case (one definite CF-empty eg orbital); every
+    other ion accepts through its shell-averaged empty orbitals (``empty_vector``).
     """
     return descriptor.coordination == "oct" and descriptor.n_eg == 1
 
@@ -464,6 +487,20 @@ def crystal_field_eg_orbital(
     if hole:
         return np.array([math.cos(half), math.sin(half)])
     return np.array([-math.sin(half), math.cos(half)])
+
+
+def empty_vector(descriptor: IonDescriptor) -> np.ndarray:
+    """Shell-averaged empty fraction per d orbital, ordered as sk_table.D_ORBITALS.
+
+    E_t2g/3 on each t2g orbital and E_eg/2 on each eg orbital (high spin fills
+    every orbital singly first, so these are the empty *majority-spin* orbitals):
+    the acceptor side of the occupied->empty channel for any ion that is not eg^1
+    (Cr3+ -> [0, 0, 0, 1, 1]; Fe3+ -> 0).
+    """
+    m = np.zeros(5)
+    m[list(T2G_INDICES)] = descriptor.ehf_t2g[0] / 3.0
+    m[list(EG_INDICES)] = descriptor.ehf_eg[0] / 2.0
+    return m
 
 
 def coherent_eg_intensity(
@@ -697,8 +734,10 @@ class BridgeGeometry:
     # for a same-element pair, the chance the two ends differ in valence. See
     # ``build_bridges``.
     de_weight: float = 1.0
-    # Occupied->empty FM channel: both ends eg^1 Hund-active-core, with the *empty*
-    # (CF) eg orbital's channel intensities on each end. ``bridge_J`` adds
+    # Occupied->empty FM channel: open when either end has an empty majority-spin
+    # orbital (the coherent CF-empty eg of an eg^1 state; the shell-averaged empty
+    # orbitals of any other, e.g. Cr3+ eg), with those orbitals' channel intensities
+    # on each end. ``bridge_J`` adds
     # -j_fm_i j_fm_j (mu_occ_i . mu_emp_j + mu_emp_i . mu_occ_j). See
     # docs/theory/magnetism-model.md.
     oe_active: bool = False
@@ -706,16 +745,20 @@ class BridgeGeometry:
     Bpi_emp_i: np.ndarray = None
     Bsig_emp_j: np.ndarray = None
     Bpi_emp_j: np.ndarray = None
-    # The occupied intensities restricted to the end's eg^1 states -- the *donor*
-    # side of the occupied->empty channel. It differs from ``Bsig_i``/``Bpi_i``
-    # only when an element is found in several oxidation states and some of them
-    # are not eg^1: those states polarize the ligand (so they belong in J_SE) but
-    # have no eg electron to donate. None means "the same as Bsig_i/Bpi_i", which
-    # is every single-valent site.
+    # Donor intensities of the occupied->empty channel. ``build_bridges`` leaves them
+    # None: every occupied orbital donates, so the donor is ``Bsig_i``/``Bpi_i``.
+    # Kept so a caller can restrict the donor by hand.
     Bsig_occ_i: np.ndarray = None
     Bpi_occ_i: np.ndarray = None
     Bsig_occ_j: np.ndarray = None
     Bpi_occ_j: np.ndarray = None
+    # Frozen Slater-type-orbital damping of each end, (sigma, pi): (S_m(r)/S_m(R0))^2.
+    # Used when ``range_model == "sto"``; see ``radial_overlap``.
+    sto_i: Tuple[float, float] = (1.0, 1.0)
+    sto_j: Tuple[float, float] = (1.0, 1.0)
+    # Centred atomic features of each end's ion (``amplitude_head.FEATURES``).
+    feat_i: Optional[np.ndarray] = None
+    feat_j: Optional[np.ndarray] = None
 
     @property
     def cos_theta(self) -> float:
@@ -740,6 +783,7 @@ def build_bridges(
     de_pairs: Optional[frozenset] = None,
     anion_bond_cutoff: float = 3.0,
     super_cutoff: float = 7.0,
+    valence: str = "class",
 ) -> List[BridgeGeometry]:
     """Enumerate M-L-M bridges between descriptor sites with actual bond vectors.
 
@@ -753,7 +797,18 @@ def build_bridges(
 
     ``de_pairs`` overrides the charge-balance double-exchange gate. When
     None it is computed via ``de_active_pairs``.
+
+    ``valence`` says what a site's oxidation state means. ``"class"`` (the default):
+    which site of a mixed-valent class carries which state is arbitrary, so every
+    site is the fraction-weighted average over its class's states (below).
+    ``"site"``: each site *is* the state it was given -- for states read off a
+    calculation (Bader / moments) or set per atom on purpose, where a Mn3+ next to a
+    Mn4+ is a statement about those two atoms. The double-exchange gate and its
+    resonance weight still come from the class fractions either way: whether
+    carriers can hop is a property of the material, not of one labelling of it.
     """
+    if valence not in ("class", "site"):
+        raise ValueError(f"valence must be 'class' or 'site', got {valence!r}.")
     # Which site of a mixed-valent element carries which state is arbitrary (see
     # ``element_oxidation_fractions``), so no site is given a definite valence. Each
     # end is the fraction-weighted average over the states its element is found in,
@@ -765,6 +820,12 @@ def build_bridges(
     # "Its element" is resolved by coordination too (``site_class_oxidation_fractions``):
     # tetrahedral and octahedral sites of one element are not interchangeable.
     fractions = site_class_oxidation_fractions(descriptors)
+
+    def end_fractions(descriptor: IonDescriptor) -> Tuple[Tuple[int, float], ...]:
+        if valence == "site":
+            return ((int(descriptor.oxidation_state), 1.0),)
+        return fractions[_site_class(descriptor)]
+
     rotations: Dict[int, np.ndarray] = {
         site: local_d_frame(
             structure, site, descriptor.coordination, ligand_cutoff=anion_bond_cutoff
@@ -773,16 +834,19 @@ def build_bridges(
     }
     state_descriptors: Dict[Tuple[str, int, str, str], IonDescriptor] = {}
     for descriptor in descriptors.values():
-        for state, _weight in fractions[_site_class(descriptor)]:
+        for state, _weight in end_fractions(descriptor):
             key = (
                 descriptor.element, state, descriptor.spin_state, descriptor.coordination
             )
             if key not in state_descriptors:
                 state_descriptors[key] = ion_descriptor(*key)
 
-    # Occupied->empty FM channel setup for eg^1 Hund-active-core states: the coherent
+    # Occupied->empty FM channel setup. Every state's empty majority-spin orbitals are
+    # its acceptor (Kanamori: at ~90 degrees a neighbour's t2g electron reaches an empty
+    # eg through the shared ligand p orbital and Hund-aligns there -> FM; at 180 the two
+    # use orthogonal p orbitals). For eg^1 Hund-active-core states the coherent
     # CF-ordered occupied eg orbital replaces the averaged eg part of the occupancy,
-    # and the orthogonal (empty) eg orbital is the FM acceptor. t2g stays averaged.
+    # and the orthogonal (empty) eg orbital is the acceptor. t2g stays averaged.
     # The CF orbital is read off the ligand cage alone, so it is shared by every
     # state of a site; only whether a state can use it depends on the valence.
     eg_mask = np.zeros(5)
@@ -794,7 +858,7 @@ def build_bridges(
             (weight, state_descriptors[
                 (descriptor.element, state, descriptor.spin_state, descriptor.coordination)
             ])
-            for state, weight in fractions[_site_class(descriptor)]
+            for state, weight in end_fractions(descriptor)
         ]
         ev = None
         if any(is_occ_empty_active(alt) for _weight, alt in alternatives):
@@ -805,7 +869,13 @@ def build_bridges(
         states = []
         for weight, alt in alternatives:
             occupancy = occupancy_vector(alt)
-            if ev is None or not is_occ_empty_active(alt):
+            if not is_occ_empty_active(alt):
+                # Kanamori acceptor: the state's empty majority-spin orbitals, shell-averaged
+                # (Cr3+ / Mn4+ d3: both eg; d5-d9 high spin: none).
+                states.append((weight, occupancy, None, empty_vector(alt), 0.0))
+                continue
+            if ev is None:
+                # eg^1 on an undistorted cage: no orbital order, so no definite empty orbital.
                 states.append((weight, occupancy, None, None, 0.0))
                 continue
             occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev[0]; occ5[EG_INDICES[1]] = ev[1]
@@ -824,30 +894,30 @@ def build_bridges(
     def _end_channels(idx, u, frame, rot):
         """Weighted channel intensities for one bridge end.
 
-        ``(Bsig, Bpi, Bsig_occ, Bpi_occ, Bsig_emp, Bpi_emp, oe_weight)``: the first
-        pair over every state (the ligand polarization, J_SE's factor), the second
-        and third over the eg^1 states alone (the donor and acceptor factors of the
-        occupied->empty channel), and the weight those eg^1 states carry.
+        ``(Bsig, Bpi, Bsig_emp, Bpi_emp)``: the occupied orbitals over every state
+        (the ligand polarization: J_SE's factor and the occupied->empty donor) and
+        the empty majority-spin orbitals over every state (the acceptor): the
+        coherent CF-empty eg orbital of an eg^1 state, the shell-averaged empty
+        orbitals of any other.
         """
         bsig = np.zeros(3); bpi = np.zeros(3)
-        bsig_occ = np.zeros(3); bpi_occ = np.zeros(3)
         bsig_emp = np.zeros(3); bpi_emp = np.zeros(3)
-        oe_weight = 0.0
-        for weight, occupancy, occ5, emp5, h_eg in site_states[idx]:
+        for weight, occupancy, occ5, emp, h_eg in site_states[idx]:
             bs, bp = _end_intensities(occupancy, u, frame, rotation=rot)
             if occ5 is not None:
                 bso, bpo = coherent_eg_intensity(occ5, u, frame, rotation=rot)
-                bse, bpe = coherent_eg_intensity(emp5, u, frame, rotation=rot)
+                bse, bpe = coherent_eg_intensity(emp, u, frame, rotation=rot)
                 bs = bs + h_eg * bso
                 bp = bp + h_eg * bpo
-                bsig_occ = bsig_occ + weight * bs
-                bpi_occ = bpi_occ + weight * bp
                 bsig_emp = bsig_emp + weight * h_eg * bse
                 bpi_emp = bpi_emp + weight * h_eg * bpe
-                oe_weight += weight
+            elif emp is not None and emp.any():
+                bse, bpe = _end_intensities(emp, u, frame, rotation=rot)
+                bsig_emp = bsig_emp + weight * bse
+                bpi_emp = bpi_emp + weight * bpe
             bsig = bsig + weight * bs
             bpi = bpi + weight * bp
-        return bsig, bpi, bsig_occ, bpi_occ, bsig_emp, bpi_emp, oe_weight
+        return bsig, bpi, bsig_emp, bpi_emp
 
     if de_pairs is None:
         de_pairs = de_active_pairs(
@@ -877,13 +947,13 @@ def build_bridges(
                 frame = bridge_frame(u_i, u_j)
                 rot_i = rotations.get(nbr_i.index)
                 rot_j = rotations.get(nbr_j.index)
-                bsig_i, bpi_i, bso_i, bpo_i, bse_i, bpe_i, oe_i = _end_channels(
-                    nbr_i.index, u_i, frame, rot_i
+                bsig_i, bpi_i, bse_i, bpe_i = _end_channels(nbr_i.index, u_i, frame, rot_i)
+                bsig_j, bpi_j, bse_j, bpe_j = _end_channels(nbr_j.index, u_j, frame, rot_j)
+                # Open wherever either end has an empty majority orbital to accept into.
+                oe_active = bool(
+                    np.abs(bse_i).sum() + np.abs(bpe_i).sum()
+                    + np.abs(bse_j).sum() + np.abs(bpe_j).sum() > 1e-12
                 )
-                bsig_j, bpi_j, bso_j, bpo_j, bse_j, bpe_j, oe_j = _end_channels(
-                    nbr_j.index, u_j, frame, rot_j
-                )
-                oe_active = oe_i > 0.0 and oe_j > 0.0
                 desc_i = descriptors[nbr_i.index]
                 desc_j = descriptors[nbr_j.index]
                 ligand = symbols[ligand_index]
@@ -918,14 +988,14 @@ def build_bridges(
                         r_jL=r_j,
                         R0_iL=r0_metal_ligand_averaged(
                             desc_i.element,
-                            fractions[_site_class(desc_i)],
+                            end_fractions(desc_i),
                             desc_i.spin_state,
                             ligand,
                             desc_i.coordination,
                         ),
                         R0_jL=r0_metal_ligand_averaged(
                             desc_j.element,
-                            fractions[_site_class(desc_j)],
+                            end_fractions(desc_j),
                             desc_j.spin_state,
                             ligand,
                             desc_j.coordination,
@@ -946,18 +1016,76 @@ def build_bridges(
                         Bpi_emp_i=bpe_i,
                         Bsig_emp_j=bse_j,
                         Bpi_emp_j=bpe_j,
-                        Bsig_occ_i=bso_i,
-                        Bpi_occ_i=bpo_i,
-                        Bsig_occ_j=bso_j,
-                        Bpi_occ_j=bpo_j,
                     )
                 )
+    _attach_sto_damping(bridges, descriptors, end_fractions)
+    from quick_mag.amplitude_head import ion_features
+
+    # Like everything else at a bridge end, the features follow the end's states: the site's own
+    # with valence="site", the site class's fractions otherwise (so which atom of a mixed-valent
+    # class carries which label cannot matter).
+    from quick_mag.amplitude_head import site_environment
+
+    feats = {}
+    for site, d in descriptors.items():
+        states = end_fractions(d)
+        env = site_environment(structure, site, d.element, states, d.spin_state, d.coordination,
+                               cutoff=anion_bond_cutoff)
+        feats[site] = sum(
+            weight * ion_features(state_descriptors[(d.element, state, d.spin_state, d.coordination)], env)
+            for state, weight in states
+        )
+    for bridge in bridges:
+        object.__setattr__(bridge, "feat_i", feats[bridge.site_i])
+        object.__setattr__(bridge, "feat_j", feats[bridge.site_j])
     return bridges
+
+
+def _attach_sto_damping(bridges: List[BridgeGeometry], descriptors: Dict[int, IonDescriptor], end_fractions) -> None:
+    """Fill each bridge end's ``sto_i`` / ``sto_j``: the (sigma, pi) STO damping (S(r)/S(R0))^2,
+    averaged over the end's oxidation-state fractions (a state's exponent depends on its charge).
+    Vectorised over every end sharing (element, states, ligand)."""
+    from quick_mag.radial_overlap import pd_damping, slater_zeta
+
+    if not bridges:
+        return
+    groups: Dict[tuple, List[Tuple[int, int]]] = {}
+    for b, bridge in enumerate(bridges):
+        for end, site in ((0, bridge.site_i), (1, bridge.site_j)):
+            d = descriptors[site]
+            key = (d.element, tuple(end_fractions(d)), bridge.ligand)
+            groups.setdefault(key, []).append((b, end))
+    for (element, fractions, ligand), ends in groups.items():
+        r = np.array([bridges[b].r_iL if e == 0 else bridges[b].r_jL for b, e in ends])
+        r0 = np.array([bridges[b].R0_iL if e == 0 else bridges[b].R0_jL for b, e in ends])
+        n_p, z_p = slater_zeta(ligand, ANION_CHARGES.get(ligand, -2), "p")
+        ds = np.zeros(len(ends)); dp = np.zeros(len(ends))
+        for state, weight in fractions:
+            n_d, z_d = slater_zeta(element, state, "d")
+            s_, p_ = pd_damping(n_d, z_d, n_p, z_p, r, r0)
+            ds += weight * s_; dp += weight * p_
+        for k, (b, e) in enumerate(ends):
+            # BridgeGeometry is frozen; this is still part of its construction
+            object.__setattr__(bridges[b], "sto_i" if e == 0 else "sto_j", (float(ds[k]), float(dp[k])))
 
 
 # ---------------------------------------------------------------------------
 # mu and J assembly
 # ---------------------------------------------------------------------------
+
+
+def end_damping(params: PolarizationParameters, metal: str, ligand: str, r, R0, sto=(1.0, 1.0)):
+    """(d_sigma, d_pi) of one bridge end (scalars or arrays): see ``PolarizationParameters.range_model``."""
+    model = params.range_model
+    if model == "exp":
+        d = np.exp(-np.sqrt(params.get_alpha(metal) * params.get_alpha(ligand)) * (np.asarray(r) - R0))
+        return d, d
+    if model == "power":
+        d = (np.asarray(R0) / np.asarray(r)) ** params.get_range_power(metal)
+        return d, d
+    if model == "sto":
+        return sto[0], sto[1]
+    raise ValueError(f"range_model must be exp, power or sto, got {model!r}")
 
 
 def bridge_J_components(
@@ -972,11 +1100,13 @@ def bridge_J_components(
       ``-tau_i * tau_j * f_i * f_j * cos^2(theta) * de_weight`` (FM; sigma-carrier
       transfer maximal at 180 degrees, zero at 90), scaled by the fraction of the
       ends' valence combinations a carrier can actually hop between.
-    - ``J_OE``, on occupied->empty-active bridges (eg^1 Hund-active-core on both
-      ends) a Kugel-Khomskii FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j +
-      mu_emp_i . mu_occ_j)`` (an electron hopping into a neighbour's empty eg
+    - ``J_OE``, on occupied->empty-active bridges (an empty majority-spin orbital
+      on either end: eg^1 Mn3+'s CF-empty eg, Cr3+/Mn4+'s empty eg) a
+      Kugel-Khomskii / Kanamori FM channel ``-j_fm_i j_fm_j (mu_occ_i . mu_emp_j +
+      mu_emp_i . mu_occ_j)`` (an electron hopping into a neighbour's empty
       orbital Hund-aligns with that site's core -> FM; quadratic in the
-      intensities, like Term A).
+      intensities, like Term A; donor and acceptor must share a ligand p orbital,
+      so for a t2g donor it is largest at 90 degrees and vanishes at 180).
 
     The two FM channels are product-rule combined, ``x_i * x_j`` for the
     per-element factors, so an unparameterized element drops the channel to zero.
@@ -984,20 +1114,18 @@ def bridge_J_components(
     against their total: which mechanism makes a pair FM is the question the
     coupling plot is there to answer.
     """
-    alpha_ligand = params.get_alpha(bridge.ligand)
-    damp_i = math.exp(
-        -math.sqrt(params.get_alpha(bridge.metal_i) * alpha_ligand)
-        * (bridge.r_iL - bridge.R0_iL)
-    )
-    damp_j = math.exp(
-        -math.sqrt(params.get_alpha(bridge.metal_j) * alpha_ligand)
-        * (bridge.r_jL - bridge.R0_jL)
-    )
+    ds_i, dp_i = end_damping(params, bridge.metal_i, bridge.ligand, bridge.r_iL, bridge.R0_iL, bridge.sto_i)
+    ds_j, dp_j = end_damping(params, bridge.metal_j, bridge.ligand, bridge.r_jL, bridge.R0_jL, bridge.sto_j)
+    damp_i, damp_j = ds_i, ds_j        # the sigma channel's: double exchange is a sigma-carrier hop
+    if (params.head_sigma or params.head_pi) and bridge.feat_i is not None:
+        from quick_mag.amplitude_head import head_factors
+
+        hs_i, hp_i = head_factors(params, bridge.feat_i)
+        hs_j, hp_j = head_factors(params, bridge.feat_j)
+        ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
-    kap_i = params.get_kappa(bridge.metal_i) * damp_i
-    kap_j = params.get_kappa(bridge.metal_j) * damp_j
-    mu_i = kap_i * (bridge.Bsig_i + g2 * bridge.Bpi_i)
-    mu_j = kap_j * (bridge.Bsig_j + g2 * bridge.Bpi_j)
+    mu_i = ds_i * bridge.Bsig_i + g2 * dp_i * bridge.Bpi_i
+    mu_j = ds_j * bridge.Bsig_j + g2 * dp_j * bridge.Bpi_j
     w = params.get_w(bridge.ligand)
     jh = params.get_jh(bridge.ligand)
     dot = float(mu_i @ mu_j)
@@ -1013,16 +1141,14 @@ def bridge_J_components(
     if bridge.oe_active:
         j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
         if j_fm != 0.0:
-            # The donor is the eg^1 part of each end, which is all of it unless the
-            # element is found in several oxidation states.
             bsig_occ_i = bridge.Bsig_i if bridge.Bsig_occ_i is None else bridge.Bsig_occ_i
             bpi_occ_i = bridge.Bpi_i if bridge.Bpi_occ_i is None else bridge.Bpi_occ_i
             bsig_occ_j = bridge.Bsig_j if bridge.Bsig_occ_j is None else bridge.Bsig_occ_j
             bpi_occ_j = bridge.Bpi_j if bridge.Bpi_occ_j is None else bridge.Bpi_occ_j
-            mu_occ_i = kap_i * (bsig_occ_i + g2 * bpi_occ_i)
-            mu_occ_j = kap_j * (bsig_occ_j + g2 * bpi_occ_j)
-            mu_emp_i = kap_i * (bridge.Bsig_emp_i + g2 * bridge.Bpi_emp_i)
-            mu_emp_j = kap_j * (bridge.Bsig_emp_j + g2 * bridge.Bpi_emp_j)
+            mu_occ_i = ds_i * bsig_occ_i + g2 * dp_i * bpi_occ_i
+            mu_occ_j = ds_j * bsig_occ_j + g2 * dp_j * bpi_occ_j
+            mu_emp_i = ds_i * bridge.Bsig_emp_i + g2 * dp_i * bridge.Bpi_emp_i
+            mu_emp_j = ds_j * bridge.Bsig_emp_j + g2 * dp_j * bridge.Bpi_emp_j
             j_oe = -(j_fm * float(mu_occ_i @ mu_emp_j + mu_emp_i @ mu_occ_j))
     return j_se, j_de, j_oe
 
@@ -1086,6 +1212,7 @@ class PairCoupling:
     j_se: float = 0.0  # superexchange; the only channel that can be AFM
     j_de: float = 0.0  # double exchange (<= 0, FM)
     j_oe: float = 0.0  # occupied->empty Kugel-Khomskii (<= 0, FM)
+    j_dd: float = 0.0  # direct d-d exchange (>= 0, AFM); only with pair_couplings(..., model=)
     #: Cartesian M-L-M paths, ``(bridge_count, 3, 3)``, ordered
     #: ``[site_i, ligand, site_j]``. Empty when built without coordinates. These are
     #: the *image* positions the bridge actually used, so a path that crosses a cell
@@ -1097,6 +1224,8 @@ def pair_couplings(
     bridges: List[BridgeGeometry],
     params: PolarizationParameters,
     cartesian_coords: Optional[np.ndarray] = None,
+    *,
+    model: Optional["ExchangeModel"] = None,
 ) -> List[PairCoupling]:
     """Per-pair couplings, summed over bridges exactly as ``build_Jeff_matrix`` does.
 
@@ -1116,6 +1245,11 @@ def pair_couplings(
     ``cartesian_coords`` is the structure's coordinates, needed only to place the
     ligand that anchors each path. Without it the couplings still carry everything
     but ``paths``.
+
+    ``model``: when given, each bridged pair also gets its direct exchange
+    ``k_dd * model.dd`` (``j_dd``, added to ``j_eff``), so ``j_eff`` is again the
+    model's matrix element. A pair close enough for direct exchange but sharing no
+    anion is not listed (in oxides at the default 3.6 A cutoff there is none).
     """
     totals: Dict[Tuple[int, int], float] = {}
     components: Dict[Tuple[int, int], List[float]] = {}
@@ -1169,6 +1303,13 @@ def pair_couplings(
                 np.array([ends[0], centre, ends[1]], dtype=np.float64)
             )
 
+    j_dd: Dict[Tuple[int, int], float] = {}
+    if model is not None and model.dd is not None and params.k_dd:
+        idx = model.site_index
+        for key in totals:
+            if key[0] in idx and key[1] in idx:
+                j_dd[key] = params.k_dd * float(model.dd[idx[key[0]], idx[key[1]]])
+                totals[key] += j_dd[key]
     return [
         PairCoupling(
             site_i=key[0],
@@ -1184,6 +1325,7 @@ def pair_couplings(
             j_se=components[key][0],
             j_de=components[key][1],
             j_oe=components[key][2],
+            j_dd=j_dd.get(key, 0.0),
             paths=(
                 np.array(paths[key], dtype=np.float64)
                 if key in paths
@@ -1200,8 +1342,127 @@ def to_solver_couplings(j_eff: np.ndarray) -> np.ndarray:
     ``spin_solver`` minimizes ``H = -1/2 sum_ij J_ij m_i m_j`` with J > 0 FM,
     so hand it ``-J_eff`` and feed it UNIT moments (+-1). Spin magnitude is
     already inside mu.
+
+    Prefer :func:`exchange_model`, whose ``J`` is per moment product and runs on the
+    actual formal moments.
     """
     return -np.asarray(j_eff)
+
+
+# ---------------------------------------------------------------------------
+# Heisenberg form on actual moments
+# ---------------------------------------------------------------------------
+
+
+def heisenberg_couplings(j_eff: np.ndarray, moments: np.ndarray) -> np.ndarray:
+    """``J_eff`` (unit-spin form, J > 0 AFM) rewritten per moment product.
+
+    ``Jt_ij = J_eff_ij / (m_i m_j)`` with ``m`` the formal moments (mu_B), so
+
+        E = 1/2 sum_ij J_eff_ij s_i s_j = 1/2 sum_ij Jt_ij (m_i s_i)(m_j s_j)
+
+    for every sign pattern ``s`` -- the same energies, now on physical moments.
+    Every channel's spin dependence is already inside ``J_eff`` (the occupancies of
+    the polarization intensities, low spin included), so this is a change of
+    convention, exact by construction: it moves the spin magnitude out of the
+    coupling and onto the moment, which is where the Heisenberg constants of DFT
+    mapping and of experiment put it. A pair with a zero moment on either end gets
+    ``Jt = 0`` (it couples to nothing).
+    """
+    j = np.asarray(j_eff, dtype=float)
+    m = np.asarray(moments, dtype=float).reshape(-1)
+    if j.shape != (m.size, m.size):
+        raise ValueError(f"J shape {j.shape} does not match {m.size} moments.")
+    mm = np.outer(m, m)
+    out = np.zeros_like(j)
+    nz = np.abs(mm) > 1e-12
+    out[nz] = j[nz] / mm[nz]
+    return out
+
+
+@dataclass
+class ExchangeModel:
+    """The exchange model of one structure under one oxidation/spin-state assignment.
+
+    ``sites`` are the magnetic (descriptor) atom indices, in the order of every
+    matrix and vector here. ``J`` is the Heisenberg coupling per moment product in
+    the model's sign convention (J > 0 AFM; the parameters' energy unit, nominally
+    eV, per mu_B^2); ``moments`` the formal spin-only moments ``2S`` (mu_B)
+    of each site's descriptor. Energy of a collinear configuration with signs ``s``:
+
+        E = 1/2 sum_ij J_ij (m_i s_i)(m_j s_j)          (:meth:`energy`)
+
+    ``solver_J`` is the same in ``spin_solver``'s convention (J > 0 FM), to be fed
+    the signed moments ``moments * s`` -- not unit spins.
+    """
+
+    sites: List[int]
+    descriptors: Dict[int, IonDescriptor]
+    bridges: List[BridgeGeometry]
+    j_eff: np.ndarray          # unit-spin form (J > 0 AFM), the old convention
+    J: np.ndarray              # per moment product (J > 0 AFM)
+    moments: np.ndarray        # formal |m| per site (mu_B)
+    # Direct-exchange geometry G (``direct_exchange.dd_geometry``, sites order): j_eff includes k_dd * G.
+    dd: Optional[np.ndarray] = None
+
+    @property
+    def solver_J(self) -> np.ndarray:
+        return -self.J
+
+    @property
+    def site_index(self) -> Dict[int, int]:
+        return {site: k for k, site in enumerate(self.sites)}
+
+    def energy(self, signs) -> float:
+        """Model energy of a collinear configuration (signs per site, in ``sites`` order)."""
+        s = np.sign(np.asarray(signs, dtype=float).reshape(-1)) * self.moments
+        return float(0.5 * s @ self.J @ s)
+
+
+def exchange_model(
+    structure,
+    assignment,
+    *,
+    params: Optional[PolarizationParameters] = None,
+    spin_states: Optional[Dict[int, str]] = None,
+    valence: str = "class",
+    descriptors: Optional[Dict[int, IonDescriptor]] = None,
+) -> ExchangeModel:
+    """Descriptors -> bridges -> couplings for one assignment, on actual moments.
+
+    ``spin_states`` (atom index -> ``"HS"``/``"LS"``; default: the assignment's own, as
+    ``site_states.ranked_assignments`` attaches them) and ``valence`` (see
+    :func:`build_bridges`) are passed through; ``descriptors`` skips building them.
+    A structure with no magnetic sites or no bridges gives empty matrices.
+    """
+    from quick_mag.ion_descriptors import formal_moments, structure_ion_descriptors
+
+    if params is None:
+        params = default_params()
+    if spin_states is None:
+        spin_states = getattr(assignment, "spin_states", None)
+    if descriptors is None:
+        descriptors = structure_ion_descriptors(structure, assignment, spin_states=spin_states)
+    sites = sorted(descriptors)
+    moment_map = formal_moments(descriptors)
+    moments = np.array([moment_map[s] for s in sites], dtype=float)
+    bridges = build_bridges(structure, descriptors, valence=valence) if sites else []
+    index = {site: k for k, site in enumerate(sites)}
+    j_eff = build_Jeff_matrix(bridges, index, params) if bridges else np.zeros((len(sites),) * 2)
+    from quick_mag.direct_exchange import dd_geometry
+
+    dd = dd_geometry(structure, descriptors, sites, cutoff=params.dd_cutoff)
+    if params.k_dd:
+        j_eff = j_eff + params.k_dd * dd
+    return ExchangeModel(
+        sites=sites,
+        descriptors=descriptors,
+        bridges=bridges,
+        j_eff=j_eff,
+        J=heisenberg_couplings(j_eff, moments),
+        moments=moments,
+        dd=dd,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1214,10 +1475,18 @@ DEFAULT_PARAMS_PATH = Path(__file__).with_name("exchange_params") / "polarizatio
 
 def params_from_dict(data: Dict) -> PolarizationParameters:
     """Build ``PolarizationParameters`` from a parsed JSON dict."""
+    if "kappa" in data or "kappa_default" in data:
+        raise ValueError(
+            "this parameter file has per-element kappa, which the model no longer has: the scale now "
+            "lives in w_ligand / jh_ligand and each ion's amplitude in head_sigma / head_pi. Refit it "
+            "(quick_mag.fitting) or fold a single shared kappa k in by hand (w, J_H x k^2; j_fm x k)."
+        )
     fields = {
-        "kappa", "alpha", "w_ligand", "jh_ligand", "t_de", "j_fm", "gamma_pi",
-        "kappa_default", "alpha_default", "w_default", "jh_default",
+        "alpha", "w_ligand", "jh_ligand", "t_de", "j_fm", "gamma_pi",
+        "alpha_default", "w_default", "jh_default",
         "t_de_default", "j_fm_default",
+        "range_model", "range_power", "range_power_default",
+        "head_sigma", "head_pi", "k_dd", "dd_cutoff",
     }
     return PolarizationParameters(**{k: v for k, v in data.items() if k in fields})
 

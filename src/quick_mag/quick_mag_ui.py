@@ -5978,6 +5978,14 @@ class AppState:
             params = default_params()
             site_index = {site: i for i, site in enumerate(magnetic_sites)}
             j_eff = build_Jeff_matrix(bridges, site_index, params)
+            # Direct d-d exchange between close metals (edge/face-sharing), as exchange_model adds it.
+            from types import SimpleNamespace
+
+            from quick_mag.direct_exchange import dd_geometry
+
+            dd = dd_geometry(structure, descriptors, magnetic_sites, cutoff=params.dd_cutoff)
+            if params.k_dd:
+                j_eff = j_eff + params.k_dd * dd
             # ``to_solver_couplings`` maps to the spin solver's sign convention;
             # spin magnitude is already inside J_eff, so the solver is fed UNIT
             # (+-1) moments (see build_unit_moment_assignment).
@@ -5986,7 +5994,8 @@ class AppState:
             # Kept in the model's own convention (J > 0 AFM), unlike the matrix
             # above: this is a readout, not solver input.
             self.magnetic_pair_couplings = pair_couplings(
-                bridges, params, structure.cartesian_coords
+                bridges, params, structure.cartesian_coords,
+                model=SimpleNamespace(dd=dd, site_index=site_index),
             )
             self._exchange_generation += 1
         except Exception as exc:

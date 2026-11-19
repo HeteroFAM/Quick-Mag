@@ -433,18 +433,83 @@ def lasr3mn4o12_jahn_teller(lasr3mn4o12):
     )
 
 
-def test_only_the_eg1_states_donate_to_the_occupied_empty_channel(
+def test_every_state_donates_and_mn4_accepts_in_the_occupied_empty_channel(
     lasr3mn4o12_jahn_teller,
 ):
-    """The OE donor carries the eg^1 weight alone; J_SE still sees every state.
-
-    Mn4+ polarizes the ligand but has no eg electron to give away, so the donor
-    intensity is a quarter-weighted subset of the SE one rather than equal to it.
-    """
+    """Mixed Mn3+/Mn4+: every occupied orbital donates (the donor is J_SE's factor),
+    and Mn4+'s empty eg joins Mn3+'s CF-empty eg orbital as the acceptor."""
     bridges, params, _site_index = _bridges(lasr3mn4o12_jahn_teller)
     oe_bridges = [bridge for bridge in bridges if bridge.oe_active]
     assert oe_bridges
     for bridge in oe_bridges:
-        assert not np.allclose(bridge.Bsig_i, bridge.Bsig_occ_i)
-        assert np.all(np.abs(bridge.Bsig_occ_i) <= np.abs(bridge.Bsig_i) + 1e-12)
+        assert bridge.Bsig_occ_i is None and bridge.Bpi_occ_i is None
+        assert np.abs(bridge.Bsig_emp_i).sum() + np.abs(bridge.Bsig_emp_j).sum() > 0.0
     assert all(bridge_J_components(b, params)[2] < 0.0 for b in oe_bridges)
+
+
+def _two_cr_bridge(angle_deg):
+    """The one bridge through the shared O of ``_two_cr_structure``."""
+    from quick_mag.ion_descriptors import ion_descriptor
+    from quick_mag.polarization_model import build_bridges
+
+    st = _two_cr_structure(angle_deg)
+    desc = {1: ion_descriptor("Cr", 3, "HS", "oct"), 2: ion_descriptor("Cr", 3, "HS", "oct")}
+    return [b for b in build_bridges(st, desc, valence="site") if b.ligand_index == 0]
+
+
+def _two_cr_structure(angle_deg):
+    """Two Cr3+ octahedra sharing one O, M-O-M angle ``angle_deg`` (bond 2.0 A)."""
+    r = 2.0
+    t = np.radians(angle_deg)
+    o = np.zeros(3)
+    m1 = np.array([r, 0.0, 0.0])
+    m2 = r * np.array([np.cos(t), np.sin(t), 0.0])
+    coords = [o, m1, m2]
+    labels = ["O", "Cr", "Cr"]
+    for m in (m1, m2):           # complete each octahedron around its own bond axis
+        u = (o - m) / r
+        a = np.array([0.0, 0.0, 1.0])
+        v = np.cross(u, a); v /= np.linalg.norm(v)
+        w = np.cross(u, v)
+        for d in (-u, v, -v, w, -w):
+            coords.append(m + r * d)
+            labels.append("O")
+    return ChemicalStructure(name=f"Cr2-{angle_deg}", lattice=np.eye(3) * 30.0,
+                             cartesian_coords=np.array(coords), atomic_labels=labels,
+                             magnetic_moments=np.zeros((len(labels), 3)), is_periodic=False)
+
+
+def test_cr3_kanamori_channel_is_ferromagnetic_at_90_and_off_at_180():
+    """d3: the t2g -> empty-eg hop needs one shared O p orbital that is pi to one Cr and
+    sigma to the other, which exists at 90 degrees and not at 180."""
+    params = default_params()
+    (b90,) = _two_cr_bridge(90.0)
+    (b180,) = _two_cr_bridge(180.0)
+    assert b90.oe_active and b180.oe_active
+    assert bridge_J_components(b90, params)[2] < 0.0
+    assert abs(bridge_J_components(b180, params)[2]) < 1e-12
+
+
+def test_direct_exchange_couples_close_cr_pairs_and_enters_j_eff():
+    """G > 0 for two Cr3+ sharing an edge (2.83 A), 0 once they are beyond the cutoff,
+    and pair_couplings(model=) adds k_dd * G to the pair so j_eff is the matrix element."""
+    from dataclasses import replace
+
+    from quick_mag.direct_exchange import dd_geometry
+    from quick_mag.ion_descriptors import ion_descriptor
+
+    (b90,) = _two_cr_bridge(90.0)
+    desc = {1: ion_descriptor("Cr", 3, "HS", "oct"), 2: ion_descriptor("Cr", 3, "HS", "oct")}
+    st = _two_cr_structure(90.0)
+    G = dd_geometry(st, desc, [1, 2], cutoff=3.6)
+    assert G[0, 1] > 0.0 and G[0, 1] == G[1, 0] and G[0, 0] == 0.0
+    assert dd_geometry(st, desc, [1, 2], cutoff=2.5)[0, 1] == 0.0
+
+    from types import SimpleNamespace
+
+    params = replace(default_params(), k_dd=0.2)
+    model = SimpleNamespace(dd=G, site_index={1: 0, 2: 1})
+    (with_dd,) = pair_couplings([b90], params, model=model)
+    (bare,) = pair_couplings([b90], params)
+    assert with_dd.j_dd == pytest.approx(0.2 * G[0, 1])
+    assert with_dd.j_eff == pytest.approx(bare.j_eff + with_dd.j_dd)

@@ -48,6 +48,10 @@ class OxidationStateAssignment:
     total_energy: float                  # model energy (lower ↔ more favorable)
     distributions: Dict[str, Dict[int, int]]  # element → {ox_state: count}
     label: str = ""
+    # Atom index -> "HS"/"LS" of every magnetic site, when the assignment came through
+    # ``site_states.ranked_assignments`` (``magnetic_moments`` then follows them too).
+    # None: high spin everywhere (tetrahedral sites always), as before.
+    spin_states: Optional[Dict[int, str]] = None
 
     def __repr__(self) -> str:
         parts = []

@@ -21,22 +21,9 @@ import numpy as np
 
 from quick_mag.structure import ChemicalStructure, build_from_generation_parameters
 from quick_mag.structure_utils import read_structure
-from quick_mag.oxidation_state_energy import (
-    enumerate_oxidation_states_by_energy,
-    enumerate_site_group_assignments,
-)
-from quick_mag.magnetic_moments import (
-    expand_distribution_to_site_assignments,
-    expand_group_assignments_to_site_assignments,
-    format_oxidation_distribution,
-)
-from quick_mag.ion_descriptors import structure_ion_descriptors
-from quick_mag.polarization_model import (
-    build_Jeff_matrix,
-    build_bridges,
-    default_params,
-    to_solver_couplings,
-)
+from quick_mag.magnetic_moments import format_oxidation_distribution
+from quick_mag.polarization_model import exchange_model
+from quick_mag.site_states import SiteStates, ranked_assignments
 from quick_mag.spin_solver import (
     NO_NONZERO_MAGNETIC_MOMENTS_MESSAGE,
     solve_for_assignment,
@@ -138,6 +125,21 @@ def _report_solved_configs(
         print(f"    ... {len(all_states) - max_configs} more (raise --max-configs to see them)")
 
 
+def _report_spin_states(model) -> None:
+    """One line per (element, state, coordination, spin) class: count and formal moment."""
+    classes = {}
+    for site, m in zip(model.sites, model.moments):
+        d = model.descriptors[site]
+        key = (d.element, d.oxidation_state, d.coordination, d.spin_state)
+        count, _m = classes.get(key, (0, m))
+        classes[key] = (count + 1, m)
+    parts = [
+        f"{n}x{el}{ox:+d}({coord},{spin}) {m:g} muB"
+        for (el, ox, coord, spin), (n, m) in sorted(classes.items())
+    ]
+    print("  magnetic sites: " + ", ".join(parts))
+
+
 def _run_assignment(structure, assignment, args) -> None:
     print(f"\n{'=' * 80}")
     print(
@@ -146,31 +148,25 @@ def _run_assignment(structure, assignment, args) -> None:
     )
     print(f"  oxidation-model energy: {assignment.total_energy:.4f}")
 
-    descriptors = structure_ion_descriptors(structure, assignment)
-    if not descriptors:
+    model = exchange_model(structure, assignment, valence=getattr(args, "valence", "class"))
+    if not model.sites:
         print("  No transition-metal magnetic sites in this assignment; skipping.")
         return
-    magnetic_site_indices = sorted(descriptors)
-
-    bridges = build_bridges(structure, descriptors)
-    if not bridges:
+    magnetic_site_indices = model.sites
+    if not model.bridges:
         print("  No exchange couplings (no M-L-M bridges found); skipping solve.")
         return
-
-    params = default_params()
-    site_index = {site: i for i, site in enumerate(magnetic_site_indices)}
-    j_matrix = to_solver_couplings(build_Jeff_matrix(bridges, site_index, params))
+    j_matrix = model.solver_J
+    _report_spin_states(model)
 
     site_indexing = _resolve_site_indexing(structure, magnetic_site_indices)
 
-    # The polarization J already encodes spin magnitude, so everything runs on
-    # unit (+-1) spins: this copy marks which sites carry a moment without
-    # double-counting magnitude. Reference and solved configs must share it to be
-    # energy-comparable.
-    unit_assignment = replace(
-        assignment,
-        magnetic_moments=(np.abs(assignment.magnetic_moments) > 1e-8).astype(float),
-    )
+    # J is per moment product, so the solver runs on the actual formal moments (2S of
+    # each site's descriptor, low spin included). Reference and solved configs share
+    # them, so their energies are comparable.
+    moments = np.zeros(structure.atom_count)
+    moments[magnetic_site_indices] = model.moments
+    unit_assignment = replace(assignment, magnetic_moments=moments)
 
     # Reference G/C/F/A configurations, in every orientation of the B grid —
     # always reported, independent of the solve.
@@ -244,6 +240,23 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         "--max-configs", type=int, default=20,
         help="Cap on solved configs printed (0 = no cap; default 20).",
     )
+    parser.add_argument(
+        "--ox", action="append", default=[], metavar="RULE",
+        help="Oxidation state rule SELECTOR=STATES, repeatable: Co=2, Co@tet=2, Co@A=2 "
+        "(site label), Mn@B=3|4 (allowed subset), #4,7-9=3 (atom indices, 0-based). "
+        "Later rules win; everything not pinned is balanced by the oxidation model.",
+    )
+    parser.add_argument(
+        "--spin", action="append", default=[], metavar="RULE",
+        help="Spin state rule SELECTOR=HS|LS, repeatable: Co3+@oct=LS, Ni=LS, #12=LS. "
+        "Unnamed sites are high spin.",
+    )
+    parser.add_argument(
+        "--valence", choices=("class", "site"), default="class",
+        help="'class' (default): a mixed-valent site is the average of its element/"
+        "coordination class's states; 'site': each site is the state it was assigned "
+        "(use with per-atom --ox pins).",
+    )
     return parser
 
 
@@ -270,59 +283,37 @@ def _provenance_oxidation_constraints(structure: ChemicalStructure) -> dict:
         return {}
 
 
-def _solve_with_constraints(structure: ChemicalStructure, args, constraints: dict) -> int:
-    """The ``solve`` pipeline with per-atom oxidation constraints."""
-    labels = structure.element_symbols()
-    ranked = enumerate_site_group_assignments(
-        labels,
-        charge=args.charge,
-        max_mixing=args.max_mixing,
-        constraints=constraints,
-        top_k=max(1, args.top_k),
-    )
-    if not ranked:
-        print("No charge-balanced oxidation-state assignments satisfy the sublattice constraints.")
-        return 1
-    print(
-        f"  Sublattice oxidation constraints on {len(constraints)} atom(s); "
-        f"top {len(ranked)} assignment(s) will be solved."
-    )
-    for group_assignment in ranked:
-        assignments = expand_group_assignments_to_site_assignments(
-            [group_assignment], structure, max_assignments=1
-        )
-        if assignments:
-            _run_assignment(structure, assignments[0], args)
-    return 0
-
-
 def solve_structure(structure: ChemicalStructure, args) -> int:
-    """Run the full magnetism pipeline for one structure."""
+    """Run the full magnetism pipeline for one structure.
+
+    Oxidation constraints are the builder's sublattice restrictions (spinels) with the
+    user's ``--ox`` rules over them; ``--spin`` rules set spin states per site.
+    """
     labels = structure.element_symbols()
     print(f"Structure: {structure.name}  ({structure.atom_count} atoms)")
     print(f"  elements: {', '.join(sorted(set(labels)))}")
 
-    constraints = _provenance_oxidation_constraints(structure)
-    if constraints:
-        return _solve_with_constraints(structure, args, constraints)
-
-    ranked = enumerate_oxidation_states_by_energy(
-        labels, charge=args.charge, max_mixing=args.max_mixing, top_k=max(1, args.top_k)
-    )
-    if not ranked:
-        print("No charge-balanced oxidation-state assignments were found.")
+    try:
+        states = SiteStates.parse(getattr(args, "ox", []) or [], getattr(args, "spin", []) or [])
+        base = _provenance_oxidation_constraints(structure)
+        assignments = ranked_assignments(
+            structure, states, charge=args.charge, max_mixing=args.max_mixing,
+            top_k=max(1, args.top_k), base_constraints=base,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
         return 1
-
-    top_distributions = [dist for dist, _energy in ranked]
-    print(f"  Top {len(top_distributions)} oxidation distribution(s) will be solved.")
-
-    for distribution in top_distributions:
-        assignments = expand_distribution_to_site_assignments([distribution], structure)
-        if not assignments:
-            continue
-        # Representative site ordering for this distribution.
-        _run_assignment(structure, assignments[0], args)
-
+    if not assignments:
+        print("No charge-balanced oxidation-state assignments satisfy the constraints.")
+        return 1
+    if base:
+        print(f"  Sublattice oxidation constraints on {len(base)} atom(s) (builder).")
+    user = states.constraints(structure)
+    if user:
+        print(f"  User oxidation constraints on {len(user)} atom(s) (--ox).")
+    print(f"  Top {len(assignments)} oxidation assignment(s) will be solved.")
+    for assignment in assignments:
+        _run_assignment(structure, assignment, args)
     return 0
 
 

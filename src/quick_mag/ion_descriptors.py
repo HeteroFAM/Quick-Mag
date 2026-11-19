@@ -54,7 +54,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import permutations, product as cartesian_product
-from typing import Dict, List, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -309,25 +309,55 @@ def site_coordination(
 
 
 def structure_ion_descriptors(
-    structure, assignment, spin: str = "HS", *, ligand_cutoff: float = 3.0
+    structure,
+    assignment,
+    spin: str = "HS",
+    *,
+    spin_states: Optional[Mapping[int, str]] = None,
+    ligand_cutoff: float = 3.0,
 ) -> Dict[int, IonDescriptor]:
     """Map each transition-metal site of an ``OxidationStateAssignment`` to its descriptor.
 
     ``assignment`` only needs a ``site_oxidation_states`` array aligned with
     ``structure``. Non-transition-metal sites (A-site cations, anions) are skipped.
     Each site's coordination (``site_coordination``) picks its crystal-field
-    ordering; tetrahedral sites are always high spin.
+    ordering.
+
+    Spin state: ``spin_states`` (atom index -> ``"HS"``/``"LS"``, usually from
+    ``quick_mag.site_states``) sets it per site; a site it does not name takes
+    ``spin``, except that a tetrahedral site defaults to high spin (its splitting is
+    ~4/9 of the octahedral one) -- a tetrahedral site is low spin only when named.
     """
     site_ox = assignment.site_oxidation_states
+    per_site = {int(k): validated_spin(v) for k, v in (spin_states or {}).items()}
     descriptors: Dict[int, IonDescriptor] = {}
     for index, symbol in enumerate(structure.element_symbols()):
         if symbol not in TRANSITION_METALS:
             continue
         coordination = site_coordination(structure, index, ligand_cutoff=ligand_cutoff)
+        site_spin = per_site.get(index, "HS" if coordination == "tet" else spin)
         descriptors[index] = ion_descriptor(
             symbol,
             int(site_ox[index]),
-            "HS" if coordination == "tet" else spin,
+            site_spin,
             coordination,
         )
     return descriptors
+
+
+def validated_spin(value: str) -> str:
+    """``"HS"`` or ``"LS"`` (case-insensitive), else ValueError."""
+    spin = str(value).strip().upper()
+    if spin not in ("HS", "LS"):
+        raise ValueError(f"spin state must be 'HS' or 'LS', got {value!r}.")
+    return spin
+
+
+def formal_moments(descriptors: Mapping[int, IonDescriptor]) -> Dict[int, float]:
+    """Spin-only moment ``2S`` (mu_B, the number of unpaired d electrons) of every descriptor site.
+
+    Follows each descriptor's spin state, so a low-spin Co3+ carries 0 and a
+    low-spin Co2+ 1 -- unlike ``magnetic_moments.get_magnetic_moment``, which is
+    the free-ion high-spin count.
+    """
+    return {int(site): 2.0 * float(d.spin) for site, d in descriptors.items()}
