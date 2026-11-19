@@ -20,6 +20,18 @@ The ligand's net per-channel polarization for a collinear configuration is
 
     J_bridge = 2 (w_L + J_H^L) (mu_i . mu_j) - 2 J_H^L (sum_p mu_{i,p}) (sum_p mu_{j,p})
 
+That is the ``kernel = "diagonal"`` form. The default ``kernel = "coherent"`` is what fourth-order perturbation
+theory of the p-d model gives: each end's polarization is the 3x3 matrix ``P = sum_a mbar_a v_a v_a^T`` over the
+ligand p shell, ``v_a = sqrt(f_sigma) A_sigma(a) u - sqrt(f_pi) t_pi(a)`` (an orbital's sigma and pi amplitudes
+add before squaring; V_pdpi / V_pdsigma < 0), and
+
+    J_bridge = 2 (w_L + J_H^L) tr(P_i P_j) - 2 J_H^L tr(P_i) tr(P_j)
+
+with no bridge frame. ``mu`` is the diagonal of ``P`` with the sigma-pi cross term dropped; the two agree for d5 and
+for bonds along the local axes and differ by tens of percent for t2g^3 ions at low symmetry (corundum, spinel A-B).
+With ``k_ee > 0`` the ion's empty majority-spin orbitals add the empty-empty (semicovalent) AFM term of
+``bridge_J_components``.
+
 Sign convention throughout: J > 0 is AFM, and the model energy of a collinear
 configuration is ``E = +1/2 sigma^T J sigma`` with sigma in {+1, 0, -1}. Spin
 magnitude lives inside mu (via ``sum_a mbar_a``); do NOT multiply by nominal
@@ -33,7 +45,8 @@ of the two orbital sets is inverted -- see ``ion_descriptors``). This equals the
 average over degenerate microstates, since J is bilinear in the occupancies. For
 octahedral eg^1 sites the shell average is replaced by the *coherent* eg orbital
 selected by a point-charge crystal field (``crystal_field_eg_orbital``), which
-also opens the occupied->empty FM channel of ``bridge_J_components``.
+also opens the occupied->empty FM channel of ``bridge_J_components``; for eg^3
+sites (Cu2+) by the orbital that holds the hole.
 """
 
 from __future__ import annotations
@@ -131,6 +144,15 @@ class PolarizationParameters:
     # (Angstrom), G from Slater-type d-d overlaps. 0 = off.
     k_dd: float = 0.0
     dd_cutoff: float = 3.6
+    # Bridge kernel: "coherent" = tr(P_i P_j), each orbital's sigma and pi amplitudes added before squaring
+    # (rotation invariant, no bridge frame); "diagonal" = the original mu_i . mu_j with sigma and pi squared
+    # separately. A parameter file without the key is read as "diagonal" (it was fitted with that kernel).
+    kernel: str = "coherent"
+    # Empty-empty (semicovalent) exchange. An ion's empty majority-spin orbitals polarize a ligand with the
+    # opposite sign to its half-filled ones (the majority-spin ligand electron delocalizes more easily: Hund),
+    # in proportion k_ee * (unpaired electrons of the ion). Two such polarizations on one ligand channel couple
+    # AFM: J_EE = 2 (w_L + J_H^L) k_ee^2 n_i n_j tr(P_i^E P_j^E), reported inside J_SE. 0 = off.
+    k_ee: float = 0.0
 
     def get_alpha(self, element: str) -> float:
         return self.alpha.get(element, self.alpha_default)
@@ -386,6 +408,14 @@ def is_occ_empty_active(descriptor: IonDescriptor) -> bool:
     other ion accepts through its shell-averaged empty orbitals (``empty_vector``).
     """
     return descriptor.coordination == "oct" and descriptor.n_eg == 1
+
+
+def is_eg_hole(descriptor: IonDescriptor) -> bool:
+    """True for an octahedral eg^3 ion (Cu2+ d9): one eg orbital is full, the other holds the
+    hole and is the only half-filled orbital, so which one it is decides every coupling
+    (x^2-y^2 in a z-elongated cage: strong in plane, none along z). ``build_bridges`` takes it
+    from ``crystal_field_eg_orbital(hole=True)``; on an undistorted cage the shell average stays."""
+    return descriptor.coordination == "oct" and descriptor.n_eg == 3
 
 
 def eg_orbital_director(
@@ -759,6 +789,14 @@ class BridgeGeometry:
     # Centred atomic features of each end's ion (``amplitude_head.FEATURES``).
     feat_i: Optional[np.ndarray] = None
     feat_j: Optional[np.ndarray] = None
+    # Polarization matrices of each end over the ligand p shell, global axes, unit amplitudes: ``T[set, part]``
+    # (3, 3, 3, 3) with set = 0 half-filled orbitals, 1 empty majority-spin orbitals (the acceptor), 2 the same
+    # weighted by each state's unpaired electrons (the empty-empty term); part = 0 sigma-sigma, 1 pi-pi,
+    # 2 sigma-pi interference (sign of V_pdpi / V_pdsigma < 0 included). An end's matrix is
+    # f_sigma T[s, 0] + f_pi T[s, 1] + sqrt(f_sigma f_pi) T[s, 2]  (``end_polarization``); the Bsig / Bpi vectors
+    # above are the diagonals of parts 0 and 1 in the bridge frame.
+    T_i: Optional[np.ndarray] = None
+    T_j: Optional[np.ndarray] = None
 
     @property
     def cos_theta(self) -> float:
@@ -774,6 +812,30 @@ def _end_intensities(
     """(Bsig, Bpi) channel intensity vectors for one bridge end."""
     w_sigma, w_pi = sk_table.channel_weights(u, frame, rotation=rotation)
     return m_occ @ w_sigma, m_occ @ w_pi
+
+
+def _orbital_matrices(weights: np.ndarray, coeffs: np.ndarray, u: np.ndarray,
+                      a_sigma: np.ndarray, t_pi: np.ndarray) -> np.ndarray:
+    """(3, 3, 3): the sigma-sigma, pi-pi and sigma-pi parts of ``sum_k w_k v_k v_k^T`` for orbitals
+    ``coeffs`` (k, 5) on the local d basis, ``v_k = (c_k . A_sigma) u - (c_k . t_pi)`` at unit amplitudes."""
+    sa = coeffs @ a_sigma                       # (k,)
+    p = coeffs @ t_pi                           # (k, 3)
+    out = np.zeros((3, 3, 3))
+    out[0] = float(weights @ (sa * sa)) * np.outer(u, u)
+    out[1] = (p * weights[:, None]).T @ p
+    cross = ((weights * sa)[:, None] * p).sum(axis=0)
+    out[2] = -(np.outer(u, cross) + np.outer(cross, u))
+    return out
+
+
+def end_polarization(T: np.ndarray, f_sigma, f_pi, coherent: bool = True) -> np.ndarray:
+    """One set's polarization matrix from its parts ``T`` (3, 3, 3) [or (n, 3, 3, 3) with arrays f]."""
+    f_sigma, f_pi = np.asarray(f_sigma, dtype=float), np.asarray(f_pi, dtype=float)
+    fs, fp = f_sigma[..., None, None], f_pi[..., None, None]
+    P = fs * T[..., 0, :, :] + fp * T[..., 1, :, :]
+    if coherent:
+        P = P + np.sqrt(fs * fp) * T[..., 2, :, :]
+    return P
 
 
 def build_bridges(
@@ -851,8 +913,8 @@ def build_bridges(
     # state of a site; only whether a state can use it depends on the valence.
     eg_mask = np.zeros(5)
     eg_mask[list(EG_INDICES)] = 1.0
-    site_states: Dict[int, List[Tuple[float, np.ndarray, Optional[np.ndarray],
-                                      Optional[np.ndarray], float]]] = {}
+    # per state: (weight, occupancy, coherent occupied eg orbital, acceptor, eg electrons in it, unpaired electrons)
+    site_states: Dict[int, List[tuple]] = {}
     for site, descriptor in descriptors.items():
         alternatives = [
             (weight, state_descriptors[
@@ -860,23 +922,37 @@ def build_bridges(
             ])
             for state, weight in end_fractions(descriptor)
         ]
-        ev = None
+        ev = ev_hole = None
         if any(is_occ_empty_active(alt) for _weight, alt in alternatives):
             ev = crystal_field_eg_orbital(
                 structure, site, rotations[site], hole=False,
                 ligand_cutoff=anion_bond_cutoff,
             )
+        if any(is_eg_hole(alt) for _weight, alt in alternatives):
+            ev_hole = crystal_field_eg_orbital(
+                structure, site, rotations[site], hole=True,
+                ligand_cutoff=anion_bond_cutoff,
+            )
         states = []
         for weight, alt in alternatives:
             occupancy = occupancy_vector(alt)
+            unpaired = float(occupancy.sum())
+            if is_eg_hole(alt):
+                # eg^3: the hole's orbital is the half-filled one; nothing is empty to accept into.
+                if ev_hole is None:
+                    states.append((weight, occupancy, None, None, 0.0, unpaired))
+                else:
+                    occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev_hole[0]; occ5[EG_INDICES[1]] = ev_hole[1]
+                    states.append((weight, occupancy * (1.0 - eg_mask), occ5, None, float(alt.ehf_eg[1]), unpaired))
+                continue
             if not is_occ_empty_active(alt):
                 # Kanamori acceptor: the state's empty majority-spin orbitals, shell-averaged
                 # (Cr3+ / Mn4+ d3: both eg; d5-d9 high spin: none).
-                states.append((weight, occupancy, None, empty_vector(alt), 0.0))
+                states.append((weight, occupancy, None, empty_vector(alt), 0.0, unpaired))
                 continue
             if ev is None:
                 # eg^1 on an undistorted cage: no orbital order, so no definite empty orbital.
-                states.append((weight, occupancy, None, None, 0.0))
+                states.append((weight, occupancy, None, None, 0.0, unpaired))
                 continue
             occ5 = np.zeros(5); occ5[EG_INDICES[0]] = ev[0]; occ5[EG_INDICES[1]] = ev[1]
             emp5 = np.zeros(5); emp5[EG_INDICES[0]] = -ev[1]; emp5[EG_INDICES[1]] = ev[0]
@@ -887,6 +963,7 @@ def build_bridges(
                     occ5,
                     emp5,
                     float(alt.ehf_eg[1]),
+                    unpaired,
                 )
             )
         site_states[site] = states
@@ -902,15 +979,16 @@ def build_bridges(
         """
         bsig = np.zeros(3); bpi = np.zeros(3)
         bsig_emp = np.zeros(3); bpi_emp = np.zeros(3)
-        for weight, occupancy, occ5, emp, h_eg in site_states[idx]:
+        for weight, occupancy, occ5, emp, h_eg, _unpaired in site_states[idx]:
             bs, bp = _end_intensities(occupancy, u, frame, rotation=rot)
             if occ5 is not None:
                 bso, bpo = coherent_eg_intensity(occ5, u, frame, rotation=rot)
-                bse, bpe = coherent_eg_intensity(emp, u, frame, rotation=rot)
                 bs = bs + h_eg * bso
                 bp = bp + h_eg * bpo
-                bsig_emp = bsig_emp + weight * h_eg * bse
-                bpi_emp = bpi_emp + weight * h_eg * bpe
+                if emp is not None:
+                    bse, bpe = coherent_eg_intensity(emp, u, frame, rotation=rot)
+                    bsig_emp = bsig_emp + weight * h_eg * bse
+                    bpi_emp = bpi_emp + weight * h_eg * bpe
             elif emp is not None and emp.any():
                 bse, bpe = _end_intensities(emp, u, frame, rotation=rot)
                 bsig_emp = bsig_emp + weight * bse
@@ -918,6 +996,27 @@ def build_bridges(
             bsig = bsig + weight * bs
             bpi = bpi + weight * bp
         return bsig, bpi, bsig_emp, bpi_emp
+
+    _unit = np.eye(5)
+
+    def _end_tensor(idx, u, rot):
+        """``BridgeGeometry.T`` of one end: the same orbitals as ``_end_channels``, as matrices."""
+        a_sigma, t_pi = sk_table.pd_amplitudes(u, rotation=rot)
+        T = np.zeros((3, 3, 3, 3))
+        for weight, occupancy, occ5, emp, h_eg, unpaired in site_states[idx]:
+            occ = _orbital_matrices(occupancy, _unit, u, a_sigma, t_pi)
+            acc = None
+            if occ5 is not None:
+                occ = occ + _orbital_matrices(np.array([h_eg]), occ5[None, :], u, a_sigma, t_pi)
+                if emp is not None:
+                    acc = _orbital_matrices(np.array([h_eg]), emp[None, :], u, a_sigma, t_pi)
+            elif emp is not None and emp.any():
+                acc = _orbital_matrices(emp, _unit, u, a_sigma, t_pi)
+            T[0] += weight * occ
+            if acc is not None:
+                T[1] += weight * acc
+                T[2] += weight * unpaired * acc
+        return T
 
     if de_pairs is None:
         de_pairs = de_active_pairs(
@@ -1016,6 +1115,8 @@ def build_bridges(
                         Bpi_emp_i=bpe_i,
                         Bsig_emp_j=bse_j,
                         Bpi_emp_j=bpe_j,
+                        T_i=_end_tensor(nbr_i.index, u_i, rot_i),
+                        T_j=_end_tensor(nbr_j.index, u_j, rot_j),
                     )
                 )
     _attach_sto_damping(bridges, descriptors, end_fractions)
@@ -1095,7 +1196,11 @@ def bridge_J_components(
 
     Returns ``(J_SE, J_DE, J_OE)``:
 
-    - ``J_SE``, superexchange (Terms A/B), carried by every bridge.
+    - ``J_SE``, superexchange (Terms A/B), carried by every bridge: ``kernel = "coherent"``
+      ``2 (w + J_H) tr(P_i P_j) - 2 J_H tr P_i tr P_j``, ``"diagonal"`` the same on ``mu``. With
+      ``k_ee > 0`` it also holds the empty-empty term ``2 (w + J_H) k_ee^2 tr(E_i E_j)`` (AFM), ``E`` the
+      polarization of each end's empty majority-spin orbitals weighted by its unpaired electrons: two Cr3+
+      on a 180 degree oxygen each take their own majority spin from the p_sigma orbital when antiparallel.
     - ``J_DE``, on DE-active bridges an Anderson-Hasegawa double-exchange term
       ``-tau_i * tau_j * f_i * f_j * cos^2(theta) * de_weight`` (FM; sigma-carrier
       transfer maximal at 180 degrees, zero at 90), scaled by the fraction of the
@@ -1124,12 +1229,26 @@ def bridge_J_components(
         hs_j, hp_j = head_factors(params, bridge.feat_j)
         ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
-    mu_i = ds_i * bridge.Bsig_i + g2 * dp_i * bridge.Bpi_i
-    mu_j = ds_j * bridge.Bsig_j + g2 * dp_j * bridge.Bpi_j
+    if params.kernel not in ("coherent", "diagonal"):
+        raise ValueError(f"kernel must be coherent or diagonal, got {params.kernel!r}")
+    have_T = bridge.T_i is not None and bridge.T_j is not None
+    coherent = params.kernel == "coherent" and have_T
     w = params.get_w(bridge.ligand)
     jh = params.get_jh(bridge.ligand)
-    dot = float(mu_i @ mu_j)
-    j_se = 2.0 * (w + jh) * dot - 2.0 * jh * float(mu_i.sum() * mu_j.sum())
+    if coherent:
+        P_i = end_polarization(bridge.T_i[0], ds_i, g2 * dp_i)
+        P_j = end_polarization(bridge.T_j[0], ds_j, g2 * dp_j)
+        j_se = 2.0 * (w + jh) * float(np.sum(P_i * P_j)) - 2.0 * jh * float(np.trace(P_i) * np.trace(P_j))
+    else:
+        mu_i = ds_i * bridge.Bsig_i + g2 * dp_i * bridge.Bpi_i
+        mu_j = ds_j * bridge.Bsig_j + g2 * dp_j * bridge.Bpi_j
+        dot = float(mu_i @ mu_j)
+        j_se = 2.0 * (w + jh) * dot - 2.0 * jh * float(mu_i.sum() * mu_j.sum())
+    if params.k_ee and have_T:
+        # empty-empty: both ends' empty majority-spin orbitals on one ligand channel (AFM)
+        E_i = end_polarization(bridge.T_i[2], ds_i, g2 * dp_i, coherent)
+        E_j = end_polarization(bridge.T_j[2], ds_j, g2 * dp_j, coherent)
+        j_se += 2.0 * (w + jh) * params.k_ee ** 2 * float(np.sum(E_i * E_j))
     j_de = 0.0
     if bridge.de_active:
         t_pair = params.get_t_de(bridge.metal_i) * params.get_t_de(bridge.metal_j)
@@ -1140,7 +1259,12 @@ def bridge_J_components(
     j_oe = 0.0
     if bridge.oe_active:
         j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
-        if j_fm != 0.0:
+        manual = any(v is not None for v in (bridge.Bsig_occ_i, bridge.Bpi_occ_i, bridge.Bsig_occ_j, bridge.Bpi_occ_j))
+        if j_fm != 0.0 and coherent and not manual:
+            A_i = end_polarization(bridge.T_i[1], ds_i, g2 * dp_i)
+            A_j = end_polarization(bridge.T_j[1], ds_j, g2 * dp_j)
+            j_oe = -(j_fm * float(np.sum(P_i * A_j) + np.sum(A_i * P_j)))
+        elif j_fm != 0.0:
             bsig_occ_i = bridge.Bsig_i if bridge.Bsig_occ_i is None else bridge.Bsig_occ_i
             bpi_occ_i = bridge.Bpi_i if bridge.Bpi_occ_i is None else bridge.Bpi_occ_i
             bsig_occ_j = bridge.Bsig_j if bridge.Bsig_occ_j is None else bridge.Bsig_occ_j
@@ -1486,9 +1610,11 @@ def params_from_dict(data: Dict) -> PolarizationParameters:
         "alpha_default", "w_default", "jh_default",
         "t_de_default", "j_fm_default",
         "range_model", "range_power", "range_power_default",
-        "head_sigma", "head_pi", "k_dd", "dd_cutoff",
+        "head_sigma", "head_pi", "k_dd", "dd_cutoff", "kernel", "k_ee",
     }
-    return PolarizationParameters(**{k: v for k, v in data.items() if k in fields})
+    values = {k: v for k, v in data.items() if k in fields}
+    values.setdefault("kernel", "diagonal")       # files from before the coherent kernel were fitted with this one
+    return PolarizationParameters(**values)
 
 
 def load_params(path) -> PolarizationParameters:

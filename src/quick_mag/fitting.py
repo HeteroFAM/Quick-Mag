@@ -22,7 +22,7 @@ leak into the fit (filter configurations whose moments changed before building s
 
 Parameters and stages
 ---------------------
-:class:`ParamSpec` names the free parameters (``"w[O]"``, ``"jh[O]"``, ``"gamma_pi"``, ``"k_dd"``,
+:class:`ParamSpec` names the free parameters (``"w[O]"``, ``"jh[O]"``, ``"gamma_pi"``, ``"k_dd"``, ``"k_ee"``,
 ``"head_sigma[ln_cn]"``, ``"head_pi[*]"``, ``"alpha[*]"`` = one shared alpha for every metal of the
 data, ...); everything else is held at the base parameter set. An exact gauge is never free: the
 ligand alpha when the data has one ligand (only sqrt(alpha_M alpha_L) enters). A staged fit is a
@@ -108,6 +108,9 @@ class FitSystem:
     Bpi_emp_j: np.ndarray
     labels: List[str] = field(default_factory=list)   # configuration names
     dd: Optional[np.ndarray] = None   # direct-exchange geometry G (n_sites, n_sites); J += k_dd * G
+    # (n_bridges, 3, 3, 3, 3): ``BridgeGeometry.T`` of each end (the coherent kernel and the empty-empty term)
+    T_i: Optional[np.ndarray] = None
+    T_j: Optional[np.ndarray] = None
 
     @property
     def elements(self) -> set:
@@ -207,6 +210,10 @@ def fit_system(
         Bpi_emp_j=arr(lambda b: b.Bpi_emp_j if b.oe_active else zeros),
         labels=list(labels),
         dd=None if getattr(model, "dd", None) is None else np.array(model.dd, dtype=float),
+        T_i=(np.array([b.T_i for b in bridges], dtype=float).reshape(len(bridges), 3, 3, 3, 3)
+             if all(b.T_i is not None for b in bridges) else None),
+        T_j=(np.array([b.T_j for b in bridges], dtype=float).reshape(len(bridges), 3, 3, 3, 3)
+             if all(b.T_j is not None for b in bridges) else None),
     )
 
 
@@ -251,12 +258,29 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
         hs_j, hp_j = head_factors(params, system.feat_j)
         ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
+    if params.kernel not in ("coherent", "diagonal"):
+        raise ValueError(f"kernel must be coherent or diagonal, got {params.kernel!r}")
+    from quick_mag.polarization_model import end_polarization
+
+    have_T = system.T_i is not None and system.T_j is not None
+    coherent = params.kernel == "coherent" and have_T
+    fs_i, fp_i, fs_j, fp_j = ds_i, g2 * dp_i, ds_j, g2 * dp_j          # per bridge
     ds_i, dp_i, ds_j, dp_j = ds_i[:, None], dp_i[:, None], ds_j[:, None], dp_j[:, None]
-    mu_i = ds_i * system.Bsig_i + g2 * dp_i * system.Bpi_i
-    mu_j = ds_j * system.Bsig_j + g2 * dp_j * system.Bpi_j
     w = _lookup(params.w_ligand, params.w_default, system.ligand)
     jh = _lookup(params.jh_ligand, params.jh_default, system.ligand)
-    j = 2.0 * (w + jh) * np.einsum("bp,bp->b", mu_i, mu_j) - 2.0 * jh * mu_i.sum(1) * mu_j.sum(1)
+    if coherent:
+        P_i = end_polarization(system.T_i[:, 0], fs_i, fp_i)
+        P_j = end_polarization(system.T_j[:, 0], fs_j, fp_j)
+        j = (2.0 * (w + jh) * np.einsum("bpq,bpq->b", P_i, P_j)
+             - 2.0 * jh * np.einsum("bpp->b", P_i) * np.einsum("bpp->b", P_j))
+    else:
+        mu_i = ds_i * system.Bsig_i + g2 * dp_i * system.Bpi_i
+        mu_j = ds_j * system.Bsig_j + g2 * dp_j * system.Bpi_j
+        j = 2.0 * (w + jh) * np.einsum("bp,bp->b", mu_i, mu_j) - 2.0 * jh * mu_i.sum(1) * mu_j.sum(1)
+    if params.k_ee and have_T:
+        E_i = end_polarization(system.T_i[:, 2], fs_i, fp_i, coherent)
+        E_j = end_polarization(system.T_j[:, 2], fs_j, fp_j, coherent)
+        j = j + 2.0 * (w + jh) * params.k_ee ** 2 * np.einsum("bpq,bpq->b", E_i, E_j)
     if np.any(system.de_env):
         t = (_lookup(params.t_de, params.t_de_default, system.metal_i)
              * _lookup(params.t_de, params.t_de_default, system.metal_j))
@@ -264,11 +288,16 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
     if np.any(system.oe_env):
         jf = (_lookup(params.j_fm, params.j_fm_default, system.metal_i)
               * _lookup(params.j_fm, params.j_fm_default, system.metal_j))
-        mo_i = ds_i * system.Bsig_occ_i + g2 * dp_i * system.Bpi_occ_i
-        mo_j = ds_j * system.Bsig_occ_j + g2 * dp_j * system.Bpi_occ_j
-        me_i = ds_i * system.Bsig_emp_i + g2 * dp_i * system.Bpi_emp_i
-        me_j = ds_j * system.Bsig_emp_j + g2 * dp_j * system.Bpi_emp_j
-        overlap = np.einsum("bp,bp->b", mo_i, me_j) + np.einsum("bp,bp->b", me_i, mo_j)
+        if coherent:
+            A_i = end_polarization(system.T_i[:, 1], fs_i, fp_i)
+            A_j = end_polarization(system.T_j[:, 1], fs_j, fp_j)
+            overlap = np.einsum("bpq,bpq->b", P_i, A_j) + np.einsum("bpq,bpq->b", A_i, P_j)
+        else:
+            mo_i = ds_i * system.Bsig_occ_i + g2 * dp_i * system.Bpi_occ_i
+            mo_j = ds_j * system.Bsig_occ_j + g2 * dp_j * system.Bpi_occ_j
+            me_i = ds_i * system.Bsig_emp_i + g2 * dp_i * system.Bpi_emp_i
+            me_j = ds_j * system.Bsig_emp_j + g2 * dp_j * system.Bpi_emp_j
+            overlap = np.einsum("bp,bp->b", mo_i, me_j) + np.einsum("bp,bp->b", me_i, mo_j)
         j = j - jf * system.oe_env * overlap
     out = np.zeros((system.n_sites, system.n_sites))
     np.add.at(out, (system.idx_i, system.idx_j), j)
@@ -298,6 +327,7 @@ _FIELDS = {
     "head_sigma": ("head_sigma", None),
     "head_pi": ("head_pi", None),
 }
+_SCALARS = ("gamma_pi", "k_dd", "k_ee")      # parameters that are one number, not a table
 # (lower, upper, prior scale as a fraction of |prior|, floor of the scale)
 _BOUNDS = {
     "alpha": (0.1, 8.0, 0.5, 0.5),
@@ -307,6 +337,7 @@ _BOUNDS = {
     "j_fm": (0.0, 5.0, 0.5, 0.1),
     "gamma_pi": (0.0, 2.0, 0.5, 0.1),
     "k_dd": (0.0, 50.0, 0.5, 0.1),
+    "k_ee": (0.0, 5.0, 0.5, 0.1),
     "n": (0.0, 30.0, 0.5, 2.0),
     "head_sigma": (-5.0, 5.0, 0.5, 0.5),
     "head_pi": (-5.0, 5.0, 0.5, 0.5),
@@ -345,7 +376,7 @@ class ParamSpec:
         frees: List[_Free] = []
         for raw in self.free:
             name = raw.replace(" ", "")
-            if name in ("gamma_pi", "k_dd"):
+            if name in _SCALARS:
                 frees.append(_Free(name, name, ()))
                 continue
             if "[" not in name or not name.endswith("]"):
@@ -384,7 +415,7 @@ class ParamSpec:
         return [f.name for f in self._frees]
 
     def _value(self, params: PolarizationParameters, f: _Free) -> float:
-        if f.kind in ("gamma_pi", "k_dd"):
+        if f.kind in _SCALARS:
             return float(getattr(params, f.kind))
         table, default = _FIELDS[f.kind]
         fallback = 0.0 if default is None else getattr(params, default)
@@ -425,7 +456,7 @@ class ParamSpec:
             head_sigma=dict(self.base.head_sigma), head_pi=dict(self.base.head_pi),
         )
         for f, v in zip(self._frees, np.asarray(x, dtype=float)):
-            if f.kind in ("gamma_pi", "k_dd"):
+            if f.kind in _SCALARS:
                 setattr(p, f.kind, float(v))
                 continue
             table = getattr(p, _FIELDS[f.kind][0])

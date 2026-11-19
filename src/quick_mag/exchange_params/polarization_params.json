@@ -1,6 +1,6 @@
 {
   "model": "exchange_polarization",
-  "_fit": "magnets param_probe.py J1 (2026-11-17): the E3 fit (equal_set_fit.py, DFT data only, five equal sets hematite / goethite / Zn-goethite / uo01 / ref01 without Mn4+) with j_fm[Co] also free. Free (10): w[O], jh[O], gamma_pi, head_sigma[ln_cn], head_sigma[d_count], head_pi[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd; j_fm[Fe], j_fm[Ni] tried and went to 0 (left unset); head ln_delta -1 fixed; F / S w and jh, t_de, alpha carried over, not refit",
+  "_fit": "magnets kernel_refit.py K2 (2026-11-19): J1's data (equal sets, DFT only) refit from J1 with kernel = coherent, k_ee free. Free (11): w[O], jh[O], gamma_pi, head_sigma[ln_cn], head_sigma[d_count], head_pi[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd, k_ee; head ln_delta -1 fixed; F / S w and jh, t_de, alpha carried over",
   "alpha": {
     "Co": 1.1554582106521285,
     "Cr": 1.8988321701449544,
@@ -15,13 +15,13 @@
     "S": 2.2295873721085604
   },
   "w_ligand": {
-    "O": 0.014652668553933882,
+    "O": 0.014515858150324771,
     "F": 0.009308232022936153,
     "S": 0.004328177103480399
   },
   "jh_ligand": {
     "F": 0.005254371285096398,
-    "O": 0.0016443080466717326,
+    "O": 0.001305632403514642,
     "S": 0.010029670851407194
   },
   "t_de": {
@@ -33,19 +33,19 @@
     "V": 0.0028546305245499147
   },
   "j_fm": {
-    "Mn": 0.2666729921599849,
-    "Cr": 0.06736998383027396,
-    "Co": 0.06189395711827346
+    "Mn": 0.28183289531692407,
+    "Cr": 0.07525584521173825,
+    "Co": 0.06545463659962875
   },
-  "gamma_pi": 0.3404549467888082,
+  "gamma_pi": 0.31980988143853106,
   "range_model": "sto",
   "head_sigma": {
-    "d_count": -0.05744472230953224,
+    "d_count": -0.06059259377710613,
     "ln_delta": -1.0,
-    "ln_cn": -2.279791730538407
+    "ln_cn": -2.3085395947364766
   },
   "head_pi": {
-    "d_count": -0.48846971599384137,
+    "d_count": -0.3928327834577471,
     "ln_delta": -1.0
   },
   "alpha_default": 2.0,
@@ -53,6 +53,8 @@
   "jh_default": 0.0037783260774204514,
   "t_de_default": 0.0,
   "j_fm_default": 0.0,
-  "k_dd": 0.22067973130068963,
-  "dd_cutoff": 3.6
+  "k_dd": 0.24071391836759928,
+  "dd_cutoff": 3.6,
+  "kernel": "coherent",
+  "k_ee": 0.19561609685620773
 }
