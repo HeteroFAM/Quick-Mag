@@ -59,6 +59,18 @@ def _global_tensors(rotation: Optional[np.ndarray]) -> np.ndarray:
     return np.einsum("ab,nbc,dc->nad", rotation, D_ORBITAL_TENSORS, rotation)
 
 
+def pair_overlap_matrix(Q_i, Q_j, zeta_i, zeta_j, vec) -> np.ndarray:
+    """(5, 5) signed d-d overlaps ``S_ab`` of site i's local orbital a with site j's b (one image), ``vec`` from
+    i to j (Angstrom); zero beyond the overlap grid."""
+    r = float(np.linalg.norm(vec))
+    F = _bond_frame(np.asarray(vec, dtype=float) / r)
+    Q_k = np.einsum("ab,nbc,dc->nad", F, D_ORBITAL_TENSORS, F)
+    c_i = np.einsum("aij,kij->ak", Q_i, Q_k)
+    c_j = np.einsum("aij,kij->ak", Q_j, Q_k)
+    S = dd_overlaps(zeta_i, zeta_j, r)[_M_OF]
+    return np.einsum("ak,bk,k->ab", c_i, c_j, S)
+
+
 def pair_dd(Q_i, Q_j, m_i, m_j, zeta_i, zeta_j, vec) -> float:
     """``sum_ab m_ia m_jb t_ab^2`` for one metal pair (one image), ``vec`` from i to j (Angstrom).
 

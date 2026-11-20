@@ -111,6 +111,11 @@ class FitSystem:
     # (n_bridges, 3, 3, 3, 3): ``BridgeGeometry.T`` of each end (the coherent kernel and the empty-empty term)
     T_i: Optional[np.ndarray] = None
     T_j: Optional[np.ndarray] = None
+    amp0_i: Optional[np.ndarray] = None   # (n_bridges, 2): absolute STO amplitudes at R0 (range models "*_abs")
+    amp0_j: Optional[np.ndarray] = None
+    G_dx: Optional[np.ndarray] = None     # (n_bridges, 4): direct-exchange interference geometry (0 beyond the cutoff)
+    ie_i: Optional[np.ndarray] = None     # (n_bridges, 3): (IE_{q+1}, IE_q, q) of each end (oe_rule "ionization")
+    ie_j: Optional[np.ndarray] = None
 
     @property
     def elements(self) -> set:
@@ -214,6 +219,11 @@ def fit_system(
              if all(b.T_i is not None for b in bridges) else None),
         T_j=(np.array([b.T_j for b in bridges], dtype=float).reshape(len(bridges), 3, 3, 3, 3)
              if all(b.T_j is not None for b in bridges) else None),
+        amp0_i=np.array([b.amp0_i for b in bridges], dtype=float).reshape(len(bridges), 2),
+        amp0_j=np.array([b.amp0_j for b in bridges], dtype=float).reshape(len(bridges), 2),
+        G_dx=np.array([np.zeros(4) if b.G_dx is None else b.G_dx for b in bridges], dtype=float).reshape(len(bridges), 4),
+        ie_i=np.array([b.ie_i for b in bridges], dtype=float).reshape(len(bridges), 3),
+        ie_j=np.array([b.ie_j for b in bridges], dtype=float).reshape(len(bridges), 3),
     )
 
 
@@ -230,6 +240,10 @@ def _damping(system: FitSystem, params: PolarizationParameters, end: str):
     """(d_sigma, d_pi) per bridge for one end, as ``polarization_model.end_damping``."""
     metal = getattr(system, f"metal_{end}")
     model = params.range_model
+    if model.endswith("_abs"):
+        ds, dp = _damping(system, replace(params, range_model=model[:-4]), end)
+        a0 = getattr(system, f"amp0_{end}")
+        return (ds, dp) if a0 is None else (ds * a0[:, 0], dp * a0[:, 1])
     if model == "exp":
         a = np.sqrt(_lookup(params.alpha, params.alpha_default, metal)
                     * _lookup(params.alpha, params.alpha_default, system.ligand))
@@ -237,6 +251,10 @@ def _damping(system: FitSystem, params: PolarizationParameters, end: str):
         return d, d
     if model == "power":
         n = _lookup(params.range_power, params.range_power_default, metal)
+        if params.n_delta:
+            from quick_mag.amplitude_head import FEATURES
+
+            n = n + params.n_delta * getattr(system, f"feat_{end}")[:, FEATURES.index("ln_delta")]
         d = getattr(system, f"rr_{end}") ** (-n)
         return d, d
     if model == "sto":
@@ -258,6 +276,10 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
         hs_j, hp_j = head_factors(params, system.feat_j)
         ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
+    if params.k_sat:
+        ks = params.k_sat
+        ds_i, dp_i = ds_i / (1.0 + ks * ds_i), dp_i / (1.0 + ks * g2 * dp_i)
+        ds_j, dp_j = ds_j / (1.0 + ks * ds_j), dp_j / (1.0 + ks * g2 * dp_j)
     if params.kernel not in ("coherent", "diagonal"):
         raise ValueError(f"kernel must be coherent or diagonal, got {params.kernel!r}")
     from quick_mag.polarization_model import end_polarization
@@ -281,6 +303,9 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
         E_i = end_polarization(system.T_i[:, 2], fs_i, fp_i, coherent)
         E_j = end_polarization(system.T_j[:, 2], fs_j, fp_j, coherent)
         j = j + 2.0 * (w + jh) * params.k_ee ** 2 * np.einsum("bpq,bpq->b", E_i, E_j)
+    if params.k_dx and system.G_dx is not None:
+        amp = np.sqrt(np.stack([fs_i * fs_j, fs_i * fp_j, fp_i * fs_j, fp_i * fp_j], axis=1))
+        j = j + params.k_dx * np.einsum("bk,bk->b", system.G_dx, amp)
     if np.any(system.de_env):
         t = (_lookup(params.t_de, params.t_de_default, system.metal_i)
              * _lookup(params.t_de, params.t_de_default, system.metal_j))
@@ -288,7 +313,37 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
     if np.any(system.oe_env):
         jf = (_lookup(params.j_fm, params.j_fm_default, system.metal_i)
               * _lookup(params.j_fm, params.j_fm_default, system.metal_j))
-        if coherent:
+        if params.oe_rule not in ("product", "acceptor", "ionization"):
+            raise ValueError(f"oe_rule must be product, acceptor or ionization, got {params.oe_rule!r}")
+        if params.oe_rule == "ionization":
+            overlap = 0.0
+            if have_T and system.ie_i is not None:
+                from quick_mag.polarization_model import oe_transfer_energy
+
+                H_i = end_polarization(system.T_i[:, 0], fs_i, fp_i, coherent)
+                H_j = end_polarization(system.T_j[:, 0], fs_j, fp_j, coherent)
+                A_i = end_polarization(system.T_i[:, 1], fs_i, fp_i, coherent)
+                A_j = end_polarization(system.T_j[:, 1], fs_j, fp_j, coherent)
+                u_ij = oe_transfer_energy(params, system.ie_i.T, system.ie_j.T)
+                u_ji = oe_transfer_energy(params, system.ie_j.T, system.ie_i.T)
+                overlap = 2.0 * (w + jh) * params.k_oe * (
+                    np.exp(-(u_ij - 3.0) / params.oe_decay) * np.einsum("bpq,bpq->b", H_i, A_j)
+                    + np.exp(-(u_ji - 3.0) / params.oe_decay) * np.einsum("bpq,bpq->b", A_i, H_j))
+            jf = 1.0
+        elif params.oe_rule == "acceptor":
+            overlap = 0.0
+            if have_T:
+                H_i = end_polarization(system.T_i[:, 0], fs_i, fp_i, coherent)
+                H_j = end_polarization(system.T_j[:, 0], fs_j, fp_j, coherent)
+                c_i = _lookup(params.j_fm, params.j_fm_default, system.metal_i)[:, None, None]
+                c_j = _lookup(params.j_fm, params.j_fm_default, system.metal_j)[:, None, None]
+                X_i = (c_i * end_polarization(system.T_i[:, 1], fs_i, fp_i, coherent)
+                       + params.k_oe * end_polarization(system.T_i[:, 2], fs_i, fp_i, coherent))
+                X_j = (c_j * end_polarization(system.T_j[:, 1], fs_j, fp_j, coherent)
+                       + params.k_oe * end_polarization(system.T_j[:, 2], fs_j, fp_j, coherent))
+                overlap = 2.0 * (w + jh) * (np.einsum("bpq,bpq->b", H_i, X_j) + np.einsum("bpq,bpq->b", X_i, H_j))
+            jf = 1.0
+        elif coherent:
             A_i = end_polarization(system.T_i[:, 1], fs_i, fp_i)
             A_j = end_polarization(system.T_j[:, 1], fs_j, fp_j)
             overlap = np.einsum("bpq,bpq->b", P_i, A_j) + np.einsum("bpq,bpq->b", A_i, P_j)
@@ -327,7 +382,7 @@ _FIELDS = {
     "head_sigma": ("head_sigma", None),
     "head_pi": ("head_pi", None),
 }
-_SCALARS = ("gamma_pi", "k_dd", "k_ee")      # parameters that are one number, not a table
+_SCALARS = ("gamma_pi", "k_dd", "k_ee", "k_oe", "k_dx", "k_sat", "n_delta", "oe_decay", "oe_charge")      # parameters that are one number, not a table
 # (lower, upper, prior scale as a fraction of |prior|, floor of the scale)
 _BOUNDS = {
     "alpha": (0.1, 8.0, 0.5, 0.5),
@@ -338,6 +393,12 @@ _BOUNDS = {
     "gamma_pi": (0.0, 2.0, 0.5, 0.1),
     "k_dd": (0.0, 50.0, 0.5, 0.1),
     "k_ee": (0.0, 5.0, 0.5, 0.1),
+    "k_oe": (0.0, 5.0, 0.5, 0.1),
+    "k_dx": (-50.0, 50.0, 0.5, 0.1),
+    "k_sat": (0.0, 20.0, 0.5, 0.2),
+    "n_delta": (-20.0, 20.0, 0.5, 1.0),
+    "oe_decay": (0.2, 30.0, 0.5, 0.5),
+    "oe_charge": (0.0, 40.0, 0.5, 3.0),
     "n": (0.0, 30.0, 0.5, 2.0),
     "head_sigma": (-5.0, 5.0, 0.5, 0.5),
     "head_pi": (-5.0, 5.0, 0.5, 0.5),

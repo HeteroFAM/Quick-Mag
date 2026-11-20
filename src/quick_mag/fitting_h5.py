@@ -146,7 +146,7 @@ def load_h5_systems(
         # the head features are pickled in the systems: their definition is part of the key
         feats = (FEATURES, tuple(sorted(DELTA.items())))
         opts = repr((str(path.resolve()), st.st_size, st.st_mtime, states, tuple(map(lambda s: tuple(s) if s else s, spin_options)),
-                     top_k, valence, max_moment_dev, max_span, min_configs, energy, feats, "T-v1"))
+                     top_k, valence, max_moment_dev, max_span, min_configs, energy, feats, "T-v3"))
         key = hashlib.sha1(opts.encode()).hexdigest()[:16]
         cpath = Path(cache) / f"{path.stem}-{key}.pkl"
         if cpath.exists():

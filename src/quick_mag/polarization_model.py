@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -125,12 +125,19 @@ class PolarizationParameters:
     #   "exp"    exp(-sqrt(alpha_M alpha_L) (r - R0))           (the original model; alpha fitted)
     #   "power"  (R0 / r)^n_M, n from ``range_power`` (Harrison's universal pd transfer
     #            t ~ r^-7/2 gives n = 7 for t^2)
+    #   "sto_abs" / "power_abs": "sto" / "power" times the ion's absolute amplitude at R0,
+    #            S_m(R0)^2 / S2_REFERENCE per channel (``radial_overlap``): ions and the pi / sigma ratio are
+    #            then set by the overlaps themselves (gamma_pi = 1 is the unscaled ratio) instead of being 1 at R0
     #   "sto"    (S_m(r) / S_m(R0))^2 per channel m = sigma, pi: overlaps of the metal-d and
     #            ligand-p Slater-type orbitals, exponents from Slater's rules for each ion
     #            (``radial_overlap``) -- frozen, nothing fitted
     range_model: str = "sto"
     range_power: Dict[str, float] = field(default_factory=dict)
     range_power_default: float = 7.0
+    # Power-law exponent's dependence on the ion's charge-transfer energy: n = n_metal + n_delta ln(Delta / 4 eV)
+    # (``amplitude_head.ln_delta``). Ionic ions (large Delta: Mn2+) are perturbative and steep, covalent ones
+    # (small Delta: Fe3+) shallow; with it one n serves every metal. 0 = off.
+    n_delta: float = 0.0
     # Per-site amplitude head (``amplitude_head``): {feature: theta} for the sigma and pi amplitudes of an
     # end, a = exp(theta . phi(ion)). Empty = no head.
     head_sigma: Dict[str, float] = field(default_factory=dict)
@@ -153,6 +160,31 @@ class PolarizationParameters:
     # in proportion k_ee * (unpaired electrons of the ion). Two such polarizations on one ligand channel couple
     # AFM: J_EE = 2 (w_L + J_H^L) k_ee^2 n_i n_j tr(P_i^E P_j^E), reported inside J_SE. 0 = off.
     k_ee: float = 0.0
+    # Occupied->empty rule. "product": -j_fm_i j_fm_j [tr(P_i A_j) + tr(A_i P_j)], a factor per element at both
+    # ends (the original). "acceptor": the coefficient belongs to the ion that owns the empty orbital,
+    #   J_OE = -2 (w_L + J_H^L) [tr(P_i X_j) + tr(X_i P_j)],   X = j_fm[element] A + k_oe E,
+    # A the polarization of the ion's empty majority-spin orbitals and E the same weighted by its unpaired
+    # electrons (the Hund splitting of the empty orbital grows with the spin it would join). A donor needs no
+    # parameter: Mn2+ donates into Cr3+'s empty eg with Cr's coefficient, whatever Mn3+ does as an acceptor.
+    # "ionization": donor and acceptor factors computed per ion from the free-ion ionization ladder
+    # (``element_data.IONIZATION_ENERGIES``) instead of fitted per element. Moving an electron from donor i (charge
+    # q_i) to acceptor j (q_j) costs U_ij = IE_{q_i + 1}(i) - IE_{q_j}(j) - oe_charge (q_i - q_j + 1), the last term
+    # the screening of the charge left behind, and
+    #   J_OE = -2 (w_L + J_H^L) k_oe [exp(-(U_ij - 3 eV) / oe_decay) tr(P_i A_j) + (i <-> j)].
+    # Fe3+ and Ni2+ have the highest next ionization energy of their charge and barely donate; Mn2+, Mn3+ and
+    # Mn4+ each get their own factors. Three numbers for every ion.
+    oe_rule: str = "product"
+    k_oe: float = 0.0
+    oe_decay: float = 1.5
+    oe_charge: float = 15.0
+    # Interference of direct d-d hopping with the hopping through a shared ligand (the Anderson channel adds the
+    # two amplitudes before squaring): J_x = k_dx sum_ab m_a m_b S_ab (v_ia . v_jb) per bridge of a pair inside
+    # dd_cutoff, S_ab the signed d-d overlap and v the p-d amplitude vectors. Derived sign: k_dx < 0. 0 = off.
+    k_dx: float = 0.0
+    # Saturation of the covalent amplitude: f -> f / (1 + k_sat f) for each end's sigma and pi intensity (head and
+    # range included). Fourth order (J ~ t^4) overstates strongly covalent bonds; with it one bare range law
+    # (power, n = 7: Harrison's t ~ r^-7/2) gives each ion its own effective exponent 7 / (1 + k_sat f). 0 = off.
+    k_sat: float = 0.0
 
     def get_alpha(self, element: str) -> float:
         return self.alpha.get(element, self.alpha_default)
@@ -786,6 +818,12 @@ class BridgeGeometry:
     # Used when ``range_model == "sto"``; see ``radial_overlap``.
     sto_i: Tuple[float, float] = (1.0, 1.0)
     sto_j: Tuple[float, float] = (1.0, 1.0)
+    # Absolute STO amplitudes at R0, (sigma, pi): S_m(R0)^2 / S2_REFERENCE (range models "*_abs").
+    amp0_i: Tuple[float, float] = (1.0, 1.0)
+    amp0_j: Tuple[float, float] = (1.0, 1.0)
+    # Direct-exchange interference geometry (4,): sum_ab m_a m_b S_ab x [A_a A_b u_i.u_j, -A_a (u_i . t_b),
+    # -(t_a . u_j) A_b, t_a . t_b]; None when the metals are beyond the direct-exchange cutoff.
+    G_dx: Optional[np.ndarray] = None
     # Centred atomic features of each end's ion (``amplitude_head.FEATURES``).
     feat_i: Optional[np.ndarray] = None
     feat_j: Optional[np.ndarray] = None
@@ -797,6 +835,10 @@ class BridgeGeometry:
     # above are the diagonals of parts 0 and 1 in the bridge frame.
     T_i: Optional[np.ndarray] = None
     T_j: Optional[np.ndarray] = None
+    # (IE_{q+1}, IE_q, q) of each end's ion, averaged over its states: donor cost, acceptor gain, charge
+    # (``oe_rule = "ionization"``).
+    ie_i: Tuple[float, float, float] = (0.0, 0.0, 3.0)
+    ie_j: Tuple[float, float, float] = (0.0, 0.0, 3.0)
 
     @property
     def cos_theta(self) -> float:
@@ -1120,6 +1162,7 @@ def build_bridges(
                     )
                 )
     _attach_sto_damping(bridges, descriptors, end_fractions)
+    _attach_direct_interference(bridges, descriptors)
     from quick_mag.amplitude_head import ion_features
 
     # Like everything else at a bridge end, the features follow the end's states: the site's own
@@ -1136,9 +1179,23 @@ def build_bridges(
             weight * ion_features(state_descriptors[(d.element, state, d.spin_state, d.coordination)], env)
             for state, weight in states
         )
+    from quick_mag.element_data import ionization_energies
+
+    ies = {}
+    for site, d in descriptors.items():
+        ladder = ionization_energies(d.element)
+        don = acc = q = 0.0
+        for state, weight in end_fractions(d):
+            state = int(state)
+            don += weight * float(ladder[state] if state < len(ladder) and ladder[state] is not None else 1e3)
+            acc += weight * float(ladder[state - 1] if 0 < state <= len(ladder) and ladder[state - 1] is not None else 0.0)
+            q += weight * state
+        ies[site] = (don, acc, q)
     for bridge in bridges:
         object.__setattr__(bridge, "feat_i", feats[bridge.site_i])
         object.__setattr__(bridge, "feat_j", feats[bridge.site_j])
+        object.__setattr__(bridge, "ie_i", ies[bridge.site_i])
+        object.__setattr__(bridge, "ie_j", ies[bridge.site_j])
     return bridges
 
 
@@ -1146,7 +1203,7 @@ def _attach_sto_damping(bridges: List[BridgeGeometry], descriptors: Dict[int, Io
     """Fill each bridge end's ``sto_i`` / ``sto_j``: the (sigma, pi) STO damping (S(r)/S(R0))^2,
     averaged over the end's oxidation-state fractions (a state's exponent depends on its charge).
     Vectorised over every end sharing (element, states, ligand)."""
-    from quick_mag.radial_overlap import pd_damping, slater_zeta
+    from quick_mag.radial_overlap import S2_REFERENCE, pd_damping, pd_overlap_sq, slater_zeta
 
     if not bridges:
         return
@@ -1161,13 +1218,51 @@ def _attach_sto_damping(bridges: List[BridgeGeometry], descriptors: Dict[int, Io
         r0 = np.array([bridges[b].R0_iL if e == 0 else bridges[b].R0_jL for b, e in ends])
         n_p, z_p = slater_zeta(ligand, ANION_CHARGES.get(ligand, -2), "p")
         ds = np.zeros(len(ends)); dp = np.zeros(len(ends))
+        a0 = np.zeros((len(ends), 2))
         for state, weight in fractions:
             n_d, z_d = slater_zeta(element, state, "d")
             s_, p_ = pd_damping(n_d, z_d, n_p, z_p, r, r0)
             ds += weight * s_; dp += weight * p_
+            s0, p0 = pd_overlap_sq(n_d, z_d, n_p, z_p, r0)
+            a0[:, 0] += weight * s0 / S2_REFERENCE; a0[:, 1] += weight * p0 / S2_REFERENCE
         for k, (b, e) in enumerate(ends):
             # BridgeGeometry is frozen; this is still part of its construction
             object.__setattr__(bridges[b], "sto_i" if e == 0 else "sto_j", (float(ds[k]), float(dp[k])))
+            object.__setattr__(bridges[b], "amp0_i" if e == 0 else "amp0_j", (float(a0[k, 0]), float(a0[k, 1])))
+
+
+def _attach_direct_interference(bridges: List[BridgeGeometry], descriptors: Dict[int, IonDescriptor],
+                                cutoff: float = 3.6) -> None:
+    """Fill ``G_dx`` on bridges whose metals are within ``cutoff``: each site in its own state (as ``dd_geometry``)."""
+    from quick_mag.direct_exchange import _global_tensors, pair_overlap_matrix
+    from quick_mag.radial_overlap import slater_zeta
+
+    cache: Dict[int, tuple] = {}
+
+    def site(idx, rot):
+        if idx not in cache:
+            d = descriptors[idx]
+            cache[idx] = (occupancy_vector(d), slater_zeta(d.element, int(d.oxidation_state), "d"), _global_tensors(rot))
+        return cache[idx]
+
+    for b in bridges:
+        vec = b.u_jL * b.r_jL - b.u_iL * b.r_iL
+        if np.linalg.norm(vec) > cutoff:
+            continue
+        m_i, z_i, Q_i = site(b.site_i, b.rot_i)
+        m_j, z_j, Q_j = site(b.site_j, b.rot_j)
+        if not m_i.any() or not m_j.any():
+            continue
+        S = pair_overlap_matrix(Q_i, Q_j, z_i, z_j, vec) * np.outer(m_i, m_j)
+        a_i, t_i = sk_table.pd_amplitudes(b.u_iL, rotation=b.rot_i)
+        a_j, t_j = sk_table.pd_amplitudes(b.u_jL, rotation=b.rot_j)
+        G = np.array([
+            float(a_i @ S @ a_j) * float(b.u_iL @ b.u_jL),
+            -float(a_i @ S @ (t_j @ b.u_iL)),
+            -float((t_i @ b.u_jL) @ S @ a_j),
+            float(np.einsum("ax,ab,bx->", t_i, S, t_j)),
+        ])
+        object.__setattr__(b, "G_dx", G)
 
 
 # ---------------------------------------------------------------------------
@@ -1175,18 +1270,36 @@ def _attach_sto_damping(bridges: List[BridgeGeometry], descriptors: Dict[int, Io
 # ---------------------------------------------------------------------------
 
 
-def end_damping(params: PolarizationParameters, metal: str, ligand: str, r, R0, sto=(1.0, 1.0)):
+def end_damping(params: PolarizationParameters, metal: str, ligand: str, r, R0, sto=(1.0, 1.0), amp0=(1.0, 1.0),
+                ln_delta=0.0):
     """(d_sigma, d_pi) of one bridge end (scalars or arrays): see ``PolarizationParameters.range_model``."""
     model = params.range_model
+    if model.endswith("_abs"):
+        ds, dp = end_damping(replace(params, range_model=model[:-4]), metal, ligand, r, R0, sto, ln_delta=ln_delta)
+        return ds * amp0[0], dp * amp0[1]
     if model == "exp":
         d = np.exp(-np.sqrt(params.get_alpha(metal) * params.get_alpha(ligand)) * (np.asarray(r) - R0))
         return d, d
     if model == "power":
-        d = (np.asarray(R0) / np.asarray(r)) ** params.get_range_power(metal)
+        d = (np.asarray(R0) / np.asarray(r)) ** (params.get_range_power(metal) + params.n_delta * ln_delta)
         return d, d
     if model == "sto":
         return sto[0], sto[1]
     raise ValueError(f"range_model must be exp, power or sto, got {model!r}")
+
+
+def oe_transfer_energy(params: PolarizationParameters, donor, acceptor):
+    """U of one electron from ``donor`` to ``acceptor`` (each ``(IE_{q+1}, IE_q, q)``, scalars or arrays), eV."""
+    return donor[0] - acceptor[1] - params.oe_charge * (donor[2] - acceptor[2] + 1.0)
+
+
+def _ln_delta(features) -> float:
+    """The ``ln_delta`` entry of an end's head features (0 without features)."""
+    if features is None:
+        return 0.0
+    from quick_mag.amplitude_head import FEATURES
+
+    return float(features[FEATURES.index("ln_delta")])
 
 
 def bridge_J_components(
@@ -1219,8 +1332,10 @@ def bridge_J_components(
     against their total: which mechanism makes a pair FM is the question the
     coupling plot is there to answer.
     """
-    ds_i, dp_i = end_damping(params, bridge.metal_i, bridge.ligand, bridge.r_iL, bridge.R0_iL, bridge.sto_i)
-    ds_j, dp_j = end_damping(params, bridge.metal_j, bridge.ligand, bridge.r_jL, bridge.R0_jL, bridge.sto_j)
+    ds_i, dp_i = end_damping(params, bridge.metal_i, bridge.ligand, bridge.r_iL, bridge.R0_iL, bridge.sto_i, bridge.amp0_i,
+                             _ln_delta(bridge.feat_i))
+    ds_j, dp_j = end_damping(params, bridge.metal_j, bridge.ligand, bridge.r_jL, bridge.R0_jL, bridge.sto_j, bridge.amp0_j,
+                             _ln_delta(bridge.feat_j))
     damp_i, damp_j = ds_i, ds_j        # the sigma channel's: double exchange is a sigma-carrier hop
     if (params.head_sigma or params.head_pi) and bridge.feat_i is not None:
         from quick_mag.amplitude_head import head_factors
@@ -1229,6 +1344,10 @@ def bridge_J_components(
         hs_j, hp_j = head_factors(params, bridge.feat_j)
         ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
+    if params.k_sat:
+        ks = params.k_sat
+        ds_i, dp_i = ds_i / (1.0 + ks * ds_i), dp_i / (1.0 + ks * g2 * dp_i)
+        ds_j, dp_j = ds_j / (1.0 + ks * ds_j), dp_j / (1.0 + ks * g2 * dp_j)
     if params.kernel not in ("coherent", "diagonal"):
         raise ValueError(f"kernel must be coherent or diagonal, got {params.kernel!r}")
     have_T = bridge.T_i is not None and bridge.T_j is not None
@@ -1249,6 +1368,9 @@ def bridge_J_components(
         E_i = end_polarization(bridge.T_i[2], ds_i, g2 * dp_i, coherent)
         E_j = end_polarization(bridge.T_j[2], ds_j, g2 * dp_j, coherent)
         j_se += 2.0 * (w + jh) * params.k_ee ** 2 * float(np.sum(E_i * E_j))
+    if params.k_dx and bridge.G_dx is not None:
+        fs_i, fp_i, fs_j, fp_j = ds_i, g2 * dp_i, ds_j, g2 * dp_j
+        j_se += params.k_dx * float(bridge.G_dx @ np.sqrt([fs_i * fs_j, fs_i * fp_j, fp_i * fs_j, fp_i * fp_j]))
     j_de = 0.0
     if bridge.de_active:
         t_pair = params.get_t_de(bridge.metal_i) * params.get_t_de(bridge.metal_j)
@@ -1260,7 +1382,28 @@ def bridge_J_components(
     if bridge.oe_active:
         j_fm = params.get_j_fm(bridge.metal_i) * params.get_j_fm(bridge.metal_j)
         manual = any(v is not None for v in (bridge.Bsig_occ_i, bridge.Bpi_occ_i, bridge.Bsig_occ_j, bridge.Bpi_occ_j))
-        if j_fm != 0.0 and coherent and not manual:
+        if params.oe_rule not in ("product", "acceptor", "ionization"):
+            raise ValueError(f"oe_rule must be product, acceptor or ionization, got {params.oe_rule!r}")
+        if params.oe_rule == "ionization":
+            if have_T and params.k_oe:
+                H_i = end_polarization(bridge.T_i[0], ds_i, g2 * dp_i, coherent)
+                H_j = end_polarization(bridge.T_j[0], ds_j, g2 * dp_j, coherent)
+                A_i = end_polarization(bridge.T_i[1], ds_i, g2 * dp_i, coherent)
+                A_j = end_polarization(bridge.T_j[1], ds_j, g2 * dp_j, coherent)
+                u_ij, u_ji = oe_transfer_energy(params, bridge.ie_i, bridge.ie_j), oe_transfer_energy(params, bridge.ie_j, bridge.ie_i)
+                j_oe = -2.0 * (w + jh) * params.k_oe * float(
+                    np.exp(-(u_ij - 3.0) / params.oe_decay) * np.sum(H_i * A_j)
+                    + np.exp(-(u_ji - 3.0) / params.oe_decay) * np.sum(A_i * H_j))
+        elif params.oe_rule == "acceptor":
+            if have_T:
+                H_i = end_polarization(bridge.T_i[0], ds_i, g2 * dp_i, coherent)
+                H_j = end_polarization(bridge.T_j[0], ds_j, g2 * dp_j, coherent)
+                X_i = (params.get_j_fm(bridge.metal_i) * end_polarization(bridge.T_i[1], ds_i, g2 * dp_i, coherent)
+                       + params.k_oe * end_polarization(bridge.T_i[2], ds_i, g2 * dp_i, coherent))
+                X_j = (params.get_j_fm(bridge.metal_j) * end_polarization(bridge.T_j[1], ds_j, g2 * dp_j, coherent)
+                       + params.k_oe * end_polarization(bridge.T_j[2], ds_j, g2 * dp_j, coherent))
+                j_oe = -2.0 * (w + jh) * float(np.sum(H_i * X_j) + np.sum(X_i * H_j))
+        elif j_fm != 0.0 and coherent and not manual:
             A_i = end_polarization(bridge.T_i[1], ds_i, g2 * dp_i)
             A_j = end_polarization(bridge.T_j[1], ds_j, g2 * dp_j)
             j_oe = -(j_fm * float(np.sum(P_i * A_j) + np.sum(A_i * P_j)))
@@ -1610,7 +1753,7 @@ def params_from_dict(data: Dict) -> PolarizationParameters:
         "alpha_default", "w_default", "jh_default",
         "t_de_default", "j_fm_default",
         "range_model", "range_power", "range_power_default",
-        "head_sigma", "head_pi", "k_dd", "dd_cutoff", "kernel", "k_ee",
+        "head_sigma", "head_pi", "k_dd", "dd_cutoff", "kernel", "k_ee", "oe_rule", "k_oe", "k_dx", "k_sat", "n_delta", "oe_decay", "oe_charge",
     }
     values = {k: v for k, v in data.items() if k in fields}
     values.setdefault("kernel", "diagonal")       # files from before the coherent kernel were fitted with this one

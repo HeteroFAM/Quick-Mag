@@ -1,6 +1,6 @@
 {
   "model": "exchange_polarization",
-  "_fit": "magnets kernel_refit.py K2 (2026-11-19): J1's data (equal sets, DFT only) refit from J1 with kernel = coherent, k_ee free. Free (11): w[O], jh[O], gamma_pi, head_sigma[ln_cn], head_sigma[d_count], head_pi[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd, k_ee; head ln_delta -1 fixed; F / S w and jh, t_de, alpha carried over",
+  "_fit": "magnets kernel_refit2.py T3 (2026-11-19): six sets, from X1; power law n = n0 + n_delta ln(Delta / 4 eV). Free (14): w[O], jh[O], gamma_pi, head_sigma[ln_cn], head_sigma[d_count], head_pi[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd, k_ee, k_dx, n[*], n_delta",
   "alpha": {
     "Co": 1.1554582106521285,
     "Cr": 1.8988321701449544,
@@ -15,13 +15,13 @@
     "S": 2.2295873721085604
   },
   "w_ligand": {
-    "O": 0.014515858150324771,
+    "O": 0.012562890918590934,
     "F": 0.009308232022936153,
     "S": 0.004328177103480399
   },
   "jh_ligand": {
     "F": 0.005254371285096398,
-    "O": 0.001305632403514642,
+    "O": 0.0005041244486917877,
     "S": 0.010029670851407194
   },
   "t_de": {
@@ -33,19 +33,19 @@
     "V": 0.0028546305245499147
   },
   "j_fm": {
-    "Mn": 0.28183289531692407,
-    "Cr": 0.07525584521173825,
-    "Co": 0.06545463659962875
+    "Mn": 0.25880281960881896,
+    "Cr": 0.10224402757280136,
+    "Co": 0.07644983980937717
   },
-  "gamma_pi": 0.31980988143853106,
-  "range_model": "sto",
+  "gamma_pi": 0.31525514465305104,
+  "range_model": "power",
   "head_sigma": {
-    "d_count": -0.06059259377710613,
+    "d_count": -0.04527406332583608,
     "ln_delta": -1.0,
-    "ln_cn": -2.3085395947364766
+    "ln_cn": -2.1777678794784254
   },
   "head_pi": {
-    "d_count": -0.3928327834577471,
+    "d_count": -0.4810634287995143,
     "ln_delta": -1.0
   },
   "alpha_default": 2.0,
@@ -53,8 +53,15 @@
   "jh_default": 0.0037783260774204514,
   "t_de_default": 0.0,
   "j_fm_default": 0.0,
-  "k_dd": 0.24071391836759928,
+  "k_dd": 0.8008126429837027,
   "dd_cutoff": 3.6,
   "kernel": "coherent",
-  "k_ee": 0.19561609685620773
+  "k_ee": 0.23590315954324914,
+  "oe_rule": "product",
+  "k_oe": 0.0,
+  "range_power_default": 3.876137460100686,
+  "k_dx": -0.11699717657544369,
+  "k_sat": 0.0,
+  "n_delta": 3.4372908344048407,
+  "range_power": {}
 }

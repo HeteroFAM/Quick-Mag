@@ -27,7 +27,7 @@ from typing import Tuple
 
 import numpy as np
 
-__all__ = ["slater_zeta", "sto_overlap", "pd_overlaps", "pd_damping"]
+__all__ = ["slater_zeta", "sto_overlap", "pd_overlaps", "pd_damping", "pd_overlap_sq", "S2_REFERENCE"]
 
 # Slater's effective principal quantum numbers
 _N_EFF = {1: 1.0, 2: 2.0, 3: 3.0, 4: 3.7, 5: 4.0, 6: 4.2}
@@ -156,3 +156,16 @@ def pd_damping(nd, zd, np_, zp, r_ang, r0_ang) -> Tuple[np.ndarray, np.ndarray]:
     s, p = pd_overlaps(nd, zd, np_, zp, r)
     s0, p0 = pd_overlaps(nd, zd, np_, zp, r0)
     return (s / s0) ** 2, (p / p0) ** 2
+
+
+def pd_overlap_sq(nd, zd, np_, zp, r_ang) -> Tuple[np.ndarray, np.ndarray]:
+    """(S_sigma^2, S_pi^2) of the normalized metal-d and ligand-p STOs at ``r_ang`` (Angstrom): absolute, so
+    comparable between ions and between the two channels."""
+    r = np.atleast_1d(np.asarray(r_ang, dtype=float)) / BOHR_ANG
+    s = sto_overlap(nd, 2, zd, np_, 1, zp, r, m=0, normalized=True)
+    p = sto_overlap(nd, 2, zd, np_, 1, zp, r, m=1, normalized=True)
+    return s ** 2, p ** 2
+
+
+#: S_sigma^2 of octahedral Fe3+ - O2- at the Shannon distance (2.045 A): the unit of the absolute amplitudes
+S2_REFERENCE = 0.023618

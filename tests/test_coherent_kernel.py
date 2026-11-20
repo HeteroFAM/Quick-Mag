@@ -140,3 +140,77 @@ def test_parameter_files_without_a_kernel_keep_the_one_they_were_fitted_with():
     assert params_from_dict({"kernel": "coherent", "k_ee": 0.2}).k_ee == 0.2
     with pytest.raises(ValueError):
         bridge_J_components(_pair("Fe", 3, 180.0), replace(default_params(), kernel="frame"))
+
+
+def test_the_acceptor_rule_needs_no_parameter_on_the_donor():
+    """Cr3+ (empty eg) next to Fe3+ (nothing empty) at 90 degrees: FM through Cr's coefficient alone, and the
+    vectorized form agrees."""
+    st, desc = _pair_structure("Cr", 3, 90.0)
+    desc = {1: desc[1], 2: ion_descriptor("Fe", 3, "HS", "oct")}
+    labels = list(st.atomic_labels); labels[2] = "Fe"
+    st = ChemicalStructure(name="CrFe", lattice=st.lattice, cartesian_coords=st.cartesian_coords, atomic_labels=labels,
+                           magnetic_moments=np.zeros((len(labels), 3)), is_periodic=False)
+    params = replace(COHERENT, oe_rule="acceptor", j_fm={"Cr": 0.5}, k_oe=0.0)
+    (b,) = [x for x in build_bridges(st, desc, valence="site") if x.ligand_index == 0]
+    assert bridge_J_components(b, params)[2] < 0.0
+    assert bridge_J_components(b, replace(params, j_fm={"Fe": 0.5}))[2] == 0.0
+    by_spin = bridge_J_components(b, replace(params, j_fm={}, k_oe=0.5 / 3.0))[2]      # Cr3+: three unpaired electrons
+    assert by_spin == pytest.approx(bridge_J_components(b, params)[2], rel=1e-9)
+    model = exchange_model(st, None, params=params, descriptors=desc, valence="site")
+    system = fit_system(model, np.array([[1, 1], [1, -1]]), np.zeros(2))
+    index = {s: k for k, s in enumerate(model.sites)}
+    assert np.allclose(j_eff_matrix(system, params), build_Jeff_matrix(model.bridges, index, params) + params.k_dd * model.dd,
+                       rtol=1e-10, atol=1e-14)
+
+
+def test_absolute_range_models_only_rescale_each_end_by_its_overlap_at_r0():
+    from quick_mag.polarization_model import end_damping
+
+    b = _pair("Fe", 3, 150.0, r=2.1)
+    for model in ("sto", "power"):
+        rel = end_damping(replace(COHERENT, range_model=model), b.metal_i, b.ligand, b.r_iL, b.R0_iL, b.sto_i, b.amp0_i)
+        ab = end_damping(replace(COHERENT, range_model=model + "_abs"), b.metal_i, b.ligand, b.r_iL, b.R0_iL, b.sto_i, b.amp0_i)
+        assert ab[0] == pytest.approx(rel[0] * b.amp0_i[0]) and ab[1] == pytest.approx(rel[1] * b.amp0_i[1])
+    assert b.amp0_i[0] == pytest.approx(1.0, abs=2e-3)          # octahedral Fe3+ - O is the unit
+    assert 0.15 < b.amp0_i[1] < 0.30                            # pi / sigma of the overlaps themselves
+    ni = _pair("Ni", 2, 180.0)
+    assert ni.amp0_i[0] < b.amp0_i[0]                           # the more contracted d shell overlaps less
+
+
+def test_direct_interference_only_inside_the_cutoff_and_vectorizes():
+    far = _pair("Cr", 3, 180.0)
+    assert far.G_dx is None
+    st, desc = _pair_structure("Cr", 3, 92.0, twist=8.0)        # 2.88 A apart
+    params = replace(COHERENT, k_dx=-0.7, k_ee=0.2)
+    (near,) = [x for x in build_bridges(st, desc, valence="site") if x.ligand_index == 0]
+    assert near.G_dx is not None and np.abs(near.G_dx).sum() > 0
+    assert bridge_J_components(near, params)[0] != bridge_J_components(near, replace(params, k_dx=0.0))[0]
+    model = exchange_model(st, None, params=params, descriptors=desc, valence="site")
+    system = fit_system(model, np.array([[1, 1], [1, -1]]), np.zeros(2))
+    index = {s: k for k, s in enumerate(model.sites)}
+    assert np.allclose(j_eff_matrix(system, params), build_Jeff_matrix(model.bridges, index, params) + params.k_dd * model.dd,
+                       rtol=1e-10, atol=1e-14)
+
+
+def test_the_ionization_rule_ranks_donors_by_their_next_ionization_energy():
+    """Into Cr3+'s empty eg at 90 degrees: Mn2+ and Co2+ donate, Ni2+ less, Fe3+ hardly; and it vectorizes."""
+    params = replace(COHERENT, oe_rule="ionization", k_oe=1.0, oe_decay=1.5, oe_charge=15.0, j_fm={})
+    out = {}
+    for el, q in (("Mn", 2), ("Co", 2), ("Ni", 2), ("Fe", 3)):
+        st, desc = _pair_structure("Cr", 3, 90.0)
+        labels = list(st.atomic_labels); labels[2] = el
+        st = ChemicalStructure(name="x", lattice=st.lattice, cartesian_coords=st.cartesian_coords, atomic_labels=labels,
+                               magnetic_moments=np.zeros((len(labels), 3)), is_periodic=False)
+        desc = {1: desc[1], 2: ion_descriptor(el, q, "HS", "oct")}
+        (b,) = [x for x in build_bridges(st, desc, valence="site") if x.ligand_index == 0]
+        t = float(np.sum(b.T_j[0] * b.T_i[1]))                 # donor (end j) x Cr acceptor geometry, unit amplitudes
+        assert b.oe_active and t > 0
+        from quick_mag.polarization_model import oe_transfer_energy
+        out[el] = float(oe_transfer_energy(params, b.ie_j, b.ie_i))
+        assert bridge_J_components(b, params)[2] < 0.0
+    assert out["Co"] < out["Ni"] < out["Fe"] and out["Mn"] < out["Ni"]
+    model = exchange_model(st, None, params=params, descriptors=desc, valence="site")
+    system = fit_system(model, np.array([[1, 1], [1, -1]]), np.zeros(2))
+    index = {s: k for k, s in enumerate(model.sites)}
+    assert np.allclose(j_eff_matrix(system, params), build_Jeff_matrix(model.bridges, index, params) + params.k_dd * model.dd,
+                       rtol=1e-10, atol=1e-14)

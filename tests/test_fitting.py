@@ -120,7 +120,7 @@ def test_a_shared_range_power_is_one_parameter():
     systems = [_system(magnetite, params=p)[1], _system(lamno3, params=p)[1]]
     spec = ParamSpec(free=["w[O]", "n[*]"], systems=systems)
     assert spec.names.count("n[*]") == 1
-    assert spec.unpack(spec.pack(p)).range_power == {m: 7.0 for m in spec.metals}
+    assert spec.unpack(spec.pack(p)).range_power == pytest.approx({m: p.range_power_default for m in spec.metals})
 
 
 # ---- amplitude head ------------------------------------------------------------------
