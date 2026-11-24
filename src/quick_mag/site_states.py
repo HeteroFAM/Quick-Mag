@@ -225,6 +225,12 @@ class SiteStates:
     site_spin: Optional[Sequence] = None
     labels: Optional[Sequence[str]] = None
     default_spin: str = "HS"
+    # Which wins where a rule and a per-atom value name the same atom. False (the
+    # default): the per-atom value, a rule being the general statement and the value
+    # the particular one. True: the rule -- for per-atom values that came with the
+    # structure file (``quick-mag solve`` reading an extxyz ``oxidation`` column),
+    # which the rules typed on the command line are then said over.
+    rules_over_sites: bool = False
 
     @classmethod
     def parse(
@@ -287,6 +293,20 @@ class SiteStates:
         labels = self._labels(structure)
         coordination = self._coordination(structure)
         out: Dict[int, FrozenSet[int]] = {}
+
+        def apply_sites() -> None:
+            per_atom = self._per_atom(self.site_oxidation, len(symbols), "site_oxidation")
+            if per_atom is None:
+                return
+            for atom, value in enumerate(per_atom):
+                if _is_unset(value):
+                    continue
+                state = int(round(float(value)))
+                _check_ion(symbols[atom], state, f"site_oxidation[{atom}]")
+                out[atom] = frozenset([state])
+
+        if self.rules_over_sites:
+            apply_sites()
         for selector, states in self.oxidation_rules:
             if selector.where is not None and selector.where not in _COORDINATIONS and labels is None:
                 raise ValueError(f"rule {selector.text!r} names a site label but the structure has none")
@@ -302,14 +322,8 @@ class SiteStates:
                     hit += 1
             if not hit:
                 warnings.warn(f"oxidation rule {selector.text!r} selects no atoms in {structure.name}")
-        per_atom = self._per_atom(self.site_oxidation, len(symbols), "site_oxidation")
-        if per_atom is not None:
-            for atom, value in enumerate(per_atom):
-                if _is_unset(value):
-                    continue
-                state = int(round(float(value)))
-                _check_ion(symbols[atom], state, f"site_oxidation[{atom}]")
-                out[atom] = frozenset([state])
+        if not self.rules_over_sites:
+            apply_sites()
         return out
 
     def spin_states(self, structure, site_oxidation_states) -> Dict[int, str]:
@@ -323,6 +337,17 @@ class SiteStates:
         labels = self._labels(structure)
         coordination = self._coordination(structure)
         out: Dict[int, str] = {}
+
+        def apply_sites() -> None:
+            per_atom = self._per_atom(self.site_spin, len(symbols), "site_spin")
+            if per_atom is None:
+                return
+            for atom, value in enumerate(per_atom):
+                if not _is_unset(value):
+                    out[atom] = validated_spin(value)
+
+        if self.rules_over_sites:
+            apply_sites()
         for selector, spin in self.spin_rules:
             if selector.where is not None and selector.where not in _COORDINATIONS and labels is None:
                 raise ValueError(f"rule {selector.text!r} names a site label but the structure has none")
@@ -336,11 +361,8 @@ class SiteStates:
                     hit += 1
             if not hit:
                 warnings.warn(f"spin rule {selector.text!r} selects no atoms in {structure.name}")
-        per_atom = self._per_atom(self.site_spin, len(symbols), "site_spin")
-        if per_atom is not None:
-            for atom, value in enumerate(per_atom):
-                if not _is_unset(value):
-                    out[atom] = validated_spin(value)
+        if not self.rules_over_sites:
+            apply_sites()
         return out
 
     def check_pinned_charge(self, structure, charge: int = 0) -> None:

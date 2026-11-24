@@ -66,8 +66,8 @@ def test_a_fit_recovers_the_parameters_that_made_the_data():
 
 def test_gauges_cannot_be_freed():
     systems = [_system(lamno3)[1]]
-    with pytest.raises(ValueError, match="not separable"):
-        ParamSpec(free=["alpha[O]"], systems=systems)
+    with pytest.raises(ValueError, match="unknown parameter kind"):
+        ParamSpec(free=["alpha[O]"], systems=systems)           # removed with the exponential range law
     with pytest.raises(ValueError, match="unknown parameter kind"):
         ParamSpec(free=["kappa[Mn]"], systems=systems)          # removed: the scale is w's
 
@@ -77,14 +77,6 @@ def test_legacy_kappa_files_are_refused():
 
     with pytest.raises(ValueError, match="no longer"):
         params_from_dict({"kappa": {"Fe": 0.15}, "gamma_pi": 0.4})
-
-
-def test_shared_alpha_is_one_parameter():
-    systems = [_system(magnetite)[1], _system(co3o4)[1]]
-    spec = ParamSpec(free=["alpha[*]", "w[O]"], systems=systems)
-    assert spec.names == ["alpha[*]", "w[O]"]
-    p = spec.unpack([2.5, 0.03])
-    assert p.alpha["Co"] == p.alpha["Fe"] == 2.5
 
 
 def test_leave_one_group_out_runs():
@@ -97,10 +89,10 @@ def test_leave_one_group_out_runs():
 # ---- range models --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("range_model", ["power", "sto"])
+@pytest.mark.parametrize("law", [dict(delta_sat=0.0, n_delta=2.0, range_power={"Fe": 6.0}), dict(delta_sat=5.0)])
 @pytest.mark.parametrize("make", [magnetite, co3o4])
-def test_range_models_vectorize_too(make, range_model):
-    p = replace(default_params(), range_model=range_model, range_power={"Fe": 6.0})
+def test_range_laws_vectorize_too(make, law):
+    p = replace(default_params(), **law)
     model, system = _system(make, params=p)
     assert np.allclose(j_eff_matrix(system, p), model.j_eff, rtol=1e-12, atol=1e-14)
 
@@ -116,7 +108,7 @@ def test_sto_damping_is_one_at_r0_and_steeper_for_pi():
 
 
 def test_a_shared_range_power_is_one_parameter():
-    p = replace(default_params(), range_model="power")
+    p = replace(default_params(), delta_sat=0.0)
     systems = [_system(magnetite, params=p)[1], _system(lamno3, params=p)[1]]
     spec = ParamSpec(free=["w[O]", "n[*]"], systems=systems)
     assert spec.names.count("n[*]") == 1
@@ -178,6 +170,52 @@ def test_smooth_coordination_number_tells_tetrahedra_from_octahedra():
     for s, d in model.descriptors.items():
         if s in feats:
             want = np.log(4 / 6) if d.coordination == "tet" else 0.0
+            assert feats[s][k] == pytest.approx(want, abs=0.05)
+
+
+def test_sigma_load_of_ideal_cages():
+    from quick_mag.amplitude_head import sigma_load
+
+    I = np.eye(3)
+    s3 = np.sqrt(3) / 2
+    cages = {
+        "oct": (np.vstack([I, -I]), 3.0),
+        "tet": (np.array([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]]), 4 / 3),
+        "square plane": (np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]]), 2.5),
+        "square pyramid": (np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]]), 2.6),
+        "trigonal bipyramid": (np.array([[0, 0, 1], [0, 0, -1], [1, 0, 0], [-0.5, s3, 0], [-0.5, -s3, 0]]), 323 / 160),
+    }
+    rng = np.random.default_rng(0)
+    for name, (u, want) in cages.items():
+        assert sigma_load(u, np.ones(len(u))) == pytest.approx(want, abs=1e-12), name
+        # rotation invariant
+        q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        assert sigma_load(u @ q.T, np.ones(len(u))) == pytest.approx(want, abs=1e-12), name
+    # = tr G^2 / tr G of the cage's sigma Gram matrix over the d shell (sk_table's sigma angular factors)
+    from quick_mag.sk_table import pd_amplitudes
+
+    for name, (u, want) in cages.items():
+        uu = u / np.linalg.norm(u, axis=1)[:, None]
+        A = np.array([pd_amplitudes(v)[0] for v in uu])
+        G = A.T @ A
+        assert np.trace(G @ G) / np.trace(G) == pytest.approx(want, abs=1e-9), name
+    # continuous: a bond switching off moves an octahedron smoothly to a square pyramid
+    oct_u = cages["oct"][0]
+    loads = [sigma_load(oct_u, np.r_[np.ones(5), w]) for w in np.linspace(1, 0, 11)]
+    assert loads[0] == pytest.approx(3.0) and loads[-1] == pytest.approx(2.6)
+    assert np.all(np.abs(np.diff(loads)) < 0.1)
+
+
+def test_sigma_load_tells_square_planes_from_tetrahedra():
+    """CN is 4 for both; the sigma load is not, and the feature reaches the bridge ends."""
+    from quick_mag.amplitude_head import FEATURES, NSIG_REF
+
+    model, _ = _system(co3o4)
+    feats = {b.site_i: b.feat_i for b in model.bridges} | {b.site_j: b.feat_j for b in model.bridges}
+    k = FEATURES.index("ln_nsig")
+    for s, d in model.descriptors.items():
+        if s in feats:
+            want = np.log((4 / 3) / NSIG_REF) if d.coordination == "tet" else 0.0
             assert feats[s][k] == pytest.approx(want, abs=0.05)
 
 

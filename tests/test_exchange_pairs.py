@@ -304,10 +304,11 @@ def test_forced_mixed_valence_opens_double_exchange(lasr3mn4o12):
 
 
 def test_jahn_teller_distortion_opens_the_occupied_empty_channel(lamno3_jahn_teller):
-    """Resolving the eg orbital is what switches the Kugel-Khomskii term on.
+    """Resolving the eg orbital makes the Kugel-Khomskii term bond-dependent.
 
-    The ideal cubic cell leaves it shut, which is why a distorted structure has to
-    be found before this channel can be seen at all.
+    In the ideal cubic cell the eg^1 level is degenerate, so every bond sees the same average over its two
+    microstates (the channel is open, as for any ion with empty majority orbitals); the cooperative Jahn-Teller
+    pattern puts the electron in one orbital and the empty orbital's lobes on some bonds, not others.
     """
     ideal_pairs, _matrix, _site_index = _couplings(
         generate_single_perovskite(
@@ -321,12 +322,13 @@ def test_jahn_teller_distortion_opens_the_occupied_empty_channel(lamno3_jahn_tel
             n_cells_z=2,
         )
     )
-    assert all(pair.j_oe == 0.0 for pair in ideal_pairs)
+    ideal = np.array([pair.j_oe for pair in ideal_pairs])
+    assert np.all(ideal < 0.0) and np.ptp(ideal) < 1e-9 * abs(ideal).max()
 
     pairs, _matrix, _site_index = _couplings(lamno3_jahn_teller)
-    oe_pairs = [pair for pair in pairs if pair.j_oe != 0.0]
-    assert oe_pairs
-    assert all(pair.j_oe < 0.0 for pair in oe_pairs)
+    oe = np.array([pair.j_oe for pair in pairs if pair.j_oe != 0.0])
+    assert oe.size and np.all(oe < 0.0)
+    assert np.ptp(oe) > 0.1 * abs(oe).max()
     assert all(pair.j_de == 0.0 for pair in pairs)
 
 

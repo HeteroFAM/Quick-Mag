@@ -4,7 +4,7 @@ Anderson kinetic exchange through the metal-metal overlap itself, no ligand in b
 
     J_dd(i, j) = k_dd * G_ij,      G_ij = sum_images sum_ab m_ia m_jb S_ab(r)^2      (J > 0 AFM, unit spins)
 
-- ``m_ia``: the net unpaired spin of orbital a (``polarization_model.occupancy_vector``: Cr3+ t2g 1, eg 0; Fe3+ all
+- ``m_ia``: the net unpaired spin of orbital a (``polarization_model.level_filling``: Cr3+ t2g 1, eg 0; Fe3+ all
   1), so only half-filled-to-half-filled orbital pairs count (4 t^2 / U, with k_dd absorbing t/S and 1/U).
 - ``S_ab``: normalized Slater-type d-d overlaps (``radial_overlap.sto_overlap``, Slater-rule 3d exponents of each
   ion -- the same exponents the p-d range law uses), Slater-Koster combined: each site's five orbitals, in its own
@@ -53,10 +53,11 @@ def _bond_frame(u: np.ndarray) -> np.ndarray:
     return np.column_stack([e1, e2, u])
 
 
-def _global_tensors(rotation: Optional[np.ndarray]) -> np.ndarray:
-    if rotation is None:
-        return D_ORBITAL_TENSORS
-    return np.einsum("ab,nbc,dc->nad", rotation, D_ORBITAL_TENSORS, rotation)
+def _global_tensors(basis: Optional[np.ndarray]) -> np.ndarray:
+    """A site's d orbitals as quadrupole tensors (``sk_table.orbital_tensors``)."""
+    from quick_mag.sk_table import orbital_tensors
+
+    return orbital_tensors(basis)
 
 
 def pair_overlap_matrix(Q_i, Q_j, zeta_i, zeta_j, vec) -> np.ndarray:
@@ -74,7 +75,7 @@ def pair_overlap_matrix(Q_i, Q_j, zeta_i, zeta_j, vec) -> np.ndarray:
 def pair_dd(Q_i, Q_j, m_i, m_j, zeta_i, zeta_j, vec) -> float:
     """``sum_ab m_ia m_jb t_ab^2`` for one metal pair (one image), ``vec`` from i to j (Angstrom).
 
-    ``Q_*``: the site's five d-orbital quadrupole tensors in global coordinates (its local frame applied).
+    ``Q_*``: the site's five d-orbital quadrupole tensors in global coordinates (``sk_table.orbital_tensors``).
     """
     r = float(np.linalg.norm(vec))
     F = _bond_frame(np.asarray(vec, dtype=float) / r)
@@ -87,35 +88,38 @@ def pair_dd(Q_i, Q_j, m_i, m_j, zeta_i, zeta_j, vec) -> float:
 
 
 def dd_geometry(structure, descriptors: Dict, sites: List[int], cutoff: float = 3.6,
-                anion_bond_cutoff: float = 3.0) -> np.ndarray:
+                anion_bond_cutoff: float = 3.0, site_charges=None, charges=None) -> np.ndarray:
     """The symmetric (n_sites, n_sites) matrix G over ``sites`` (J_dd = k_dd * G), every periodic image within
     ``cutoff`` summed. Each site uses its own descriptor's state (with ``valence="class"`` that is the state the
-    assignment gave it, not the class average the bridges use)."""
-    from quick_mag.polarization_model import local_d_frame, occupancy_vector
+    assignment gave it, not the class average the bridges use), mixed over its level orderings
+    (``polarization_model.site_orbital_components``: octahedral / tetrahedral weights from the cubic field; G is
+    bilinear in the two sites, so it mixes over the combinations)."""
+    from quick_mag.polarization_model import model_charges, site_orbital_components
 
     index = {s: k for k, s in enumerate(sites)}
     n = len(sites)
     G = np.zeros((n, n))
     if n == 0:
         return G
-    occ, zeta, Q = {}, {}, {}
+    comps, zeta = {}, {}
+    if charges is None:                     # as build_bridges' default (valence="class")
+        charges = model_charges(structure, descriptors, site_charges, "class")
     for s in sites:
         d = descriptors[s]
-        occ[s] = occupancy_vector(d)
+        comps[s] = [(w, m, _global_tensors(b)) for w, m, b in
+                    site_orbital_components(structure, s, d, ligand_cutoff=anion_bond_cutoff,
+                                                            charges=charges) if m.any()]
         zeta[s] = slater_zeta(d.element, int(d.oxidation_state), "d")
-        try:
-            rot = local_d_frame(structure, s, d.coordination, ligand_cutoff=anion_bond_cutoff)
-        except Exception:
-            rot = None
-        Q[s] = _global_tensors(rot)
     for s in sites:
-        if not occ[s].any():
+        if not comps[s]:
             continue
         x = structure.cartesian_coords[s]
         for nb in structure.neighbors(s, cutoff):
             j = nb.index
-            if j not in index or nb.nn_distance < 1e-6 or not occ[j].any():
+            if j not in index or nb.nn_distance < 1e-6 or not comps[j]:
                 continue
-            G[index[s], index[j]] += pair_dd(Q[s], Q[j], occ[s], occ[j], zeta[s], zeta[j],
-                                             np.asarray(nb.coords) - x)
+            vec = np.asarray(nb.coords) - x
+            for w_s, m_s, Q_s in comps[s]:
+                for w_j, m_j, Q_j in comps[j]:
+                    G[index[s], index[j]] += w_s * w_j * pair_dd(Q_s, Q_j, m_s, m_j, zeta[s], zeta[j], vec)
     return 0.5 * (G + G.T)

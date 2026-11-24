@@ -23,7 +23,8 @@ from quick_mag.export_utils import (
     export_structure,
 )
 from quick_mag.structure import ChemicalStructure
-from quick_mag.structure_utils import read_structure
+from quick_mag.extxyz_io import Frame
+from quick_mag.structure_utils import read_structure_frames
 
 DEFAULT_OUTPUT_DIR = "chgnet_structures"
 
@@ -73,6 +74,34 @@ def _report(result) -> None:
         )
 
 
+def _xyz_extras(result, frame: Frame) -> dict:
+    """Comment-line keys and columns of a result for ``--format xyz``.
+
+    The input frame's own keys and columns are kept (CHGNet preserves the atom order),
+    with the calculation's on top: ``energy`` (eV), ``max_force`` (eV/A), ``calculation``,
+    ``converged``, and per atom ``forces`` (eV/A) and ``chgnet_absm`` -- CHGNet's
+    unsigned |m| (mu_B), a diagnostic that is never written as a spin.
+    """
+    info = dict(frame.info or {})
+    arrays = dict(frame.arrays or {})
+    n = result.final_structure.atom_count
+    arrays = {key: value for key, value in arrays.items() if len(value) == n}
+    info.update({
+        "energy": float(result.energy),
+        "energy_per_atom": float(result.energy_per_atom),
+        "max_force": float(result.max_force),
+        "calculation": result.calculation,
+        "converged": bool(result.converged),
+    })
+    forces = np.asarray(result.forces, dtype=float)
+    if forces.shape == (n, 3):
+        arrays["forces"] = forces
+    absm = np.abs(np.asarray(result.magnetic_moments, dtype=float)).reshape(-1)
+    if absm.size == n:
+        arrays["chgnet_absm"] = absm
+    return {"xyz_info": info, "xyz_arrays": arrays}
+
+
 def run_chgnet(
     args: argparse.Namespace,
     structures: Optional[List[ChemicalStructure]] = None,
@@ -91,8 +120,15 @@ def run_chgnet(
 
     calculation = resolve_calculation(args)
 
+    # What an extended xyz input carried besides the structure (comment-line keys and
+    # per-atom columns), by position: written back out by ``--format xyz``.
+    frames: List[Frame] = []
     if structures is None:
-        structures = [read_structure(path) for path in args.structures]
+        for path in args.structures:
+            frames.extend(read_structure_frames(path))
+        structures = [frame.structure for frame in frames]
+    else:
+        frames = [Frame(structure=structure) for structure in structures]
     if not structures:
         raise ValueError("No structures to run; give at least one structure file.")
 
@@ -102,7 +138,8 @@ def run_chgnet(
         out_dir.mkdir(parents=True, exist_ok=True)
 
     relaxed: List[ChemicalStructure] = []
-    for structure in structures:
+    seen_names: dict = {}
+    for structure, frame in zip(structures, frames):
         print(
             f"\nCHGNet {calculation}: {structure.name} "
             f"({structure.atom_count} atoms)"
@@ -116,13 +153,20 @@ def run_chgnet(
             verbose=args.verbose,
         )
         _report(result)
+        # Frames of one file often share a name, and the name is the output file's stem.
+        name = result.final_structure.name
+        if name in seen_names:
+            seen_names[name] += 1
+            result.final_structure.name = f"{name}_{seen_names[name]:03d}"
+        else:
+            seen_names[name] = 1
         relaxed.append(result.final_structure)
         if out_dir is not None:
             options = export_options(args)
-            export_structure(result.final_structure, out_dir, **options)
-            suffixes = " + ".join(
-                ".cif" if name == "cif" else ".vasp" for name in options["formats"]
+            export_structure(
+                result.final_structure, out_dir, **options, **_xyz_extras(result, frame)
             )
+            suffixes = " + ".join(f".{name}" for name in options["formats"])
             print(f"  wrote {result.final_structure.name}{suffixes} -> {out_dir}")
     return relaxed
 
@@ -138,7 +182,7 @@ def configure_chgnet_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     """Attach the ``chgnet`` command's arguments to ``parser`` (reused by the CLI)."""
     parser.add_argument(
         "structures", type=Path, nargs="*",
-        help="Structure file(s): .cif (P1) or .vasp/POSCAR. Omit when the "
+        help="Structure file(s): .cif (P1), .vasp/POSCAR or extended xyz (every frame). Omit when the "
         "structures come from an earlier stage of a '::' chain.",
     )
 

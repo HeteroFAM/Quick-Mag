@@ -5,6 +5,7 @@ import sys
 import unittest
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -29,9 +30,8 @@ from quick_mag.polarization_model import (  # noqa: E402
     build_bridges,
     build_Jeff_matrix,
     default_params,
-    is_eg_active,
-    is_occ_empty_active,
-    local_d_frame,
+    crystal_field_basis,
+    level_filling,
     occupancy_vector,
     site_class_oxidation_fractions,
 )
@@ -156,17 +156,30 @@ class CoordinationDetectionTest(unittest.TestCase):
 
 
 class TetrahedralFrameTest(unittest.TestCase):
-    def test_ideal_tetrahedron_frame_is_the_cube(self):
+    def test_ideal_tetrahedron_levels_are_e_and_t2(self):
+        # e = (dz2, dx2-y2) and t2 = (dxy, dxz, dyz) on the axes of the cube the ligands sit on, which are the
+        # crystal axes here: the crystal-field orbitals span exactly those two sets.
         structure = _cobalt_ferrite()
-        frame = local_d_frame(structure, 0, "tet")
-        self.assertTrue(_is_signed_permutation(frame), frame)
+        basis, _split = crystal_field_basis(structure, 0, "tet")
+        np.testing.assert_allclose(basis @ basis.T, np.eye(5), atol=1e-10)
+        np.testing.assert_allclose(basis[:3, 3:], 0.0, atol=1e-8)
+        np.testing.assert_allclose(basis[3:, :3], 0.0, atol=1e-8)
 
-    def test_frame_rotates_with_the_structure(self):
+    def test_levels_turn_with_the_structure(self):
+        from quick_mag.sk_table import orbital_tensors
+
         structure = _cobalt_ferrite()
         rotation = _rotation()
-        frame = local_d_frame(structure, 0, "tet")
-        rotated = local_d_frame(_rotated(structure, rotation), 0, "tet")
-        self.assertTrue(_is_signed_permutation(frame.T @ rotation.T @ rotated))
+        for site, label in ((0, "tet"), (len(structure.atomic_labels) // 4, "oct")):
+            if structure.atomic_labels[site] == "O":
+                continue
+            Q = orbital_tensors(crystal_field_basis(structure, site, label)[0])
+            Qr = orbital_tensors(crystal_field_basis(_rotated(structure, rotation), site, label)[0])
+            for shell in (slice(0, 3), slice(3, 5)):       # the projector on each level turns with the crystal
+                proj = np.einsum("aij,akl->ijkl", Q[shell], Q[shell])
+                proj_r = np.einsum("aij,akl->ijkl", Qr[shell], Qr[shell])
+                turned = np.einsum("im,jn,ko,lp,mnop->ijkl", rotation, rotation, rotation, rotation, proj)
+                np.testing.assert_allclose(proj_r, turned, atol=1e-8)
 
     def test_couplings_do_not_depend_on_orientation(self):
         # With the old global-frame fallback the tetrahedral sites' orbitals did
@@ -180,7 +193,11 @@ class TetrahedralFrameTest(unittest.TestCase):
 
 
 class RadiusAndOrbitalGatingTest(unittest.TestCase):
-    def test_tetrahedral_reference_length_uses_the_iv_radius(self):
+    def test_tetrahedral_reference_length_is_the_bond_valence_one(self):
+        """R0 = the octahedral (Shannon VI) length + b ln(CN / 6): continuous in the cage, no label. At CN 4 the
+        shift (-0.150 A) is the Shannon IV - VI difference to within 0.02 A."""
+        from quick_mag.polarization_model import BOND_VALENCE_B
+
         structure = generate_normal_spinel(
             "MnFe2O4", a_site="Mn", b_site="Fe", a=8.5, u=0.26,
             sublattice_oxidation_states={"A": {"Mn": (2,)}, "B": {"Fe": (3,)}},
@@ -190,22 +207,34 @@ class RadiusAndOrbitalGatingTest(unittest.TestCase):
         )
         o_radius = _shannon_crystal_radius("O", -2, None)
         expected = {
-            "Mn": _shannon_crystal_radius("Mn", 2, "High Spin", "IV") + o_radius,
+            "Mn": _shannon_crystal_radius("Mn", 2, "High Spin", "VI") + o_radius + BOND_VALENCE_B * np.log(4 / 6),
             "Fe": _shannon_crystal_radius("Fe", 3, "High Spin", "VI") + o_radius,
         }
         ends = {(b.metal_i, b.R0_iL) for b in bridges} | {(b.metal_j, b.R0_jL) for b in bridges}
         self.assertEqual({metal for metal, _ in ends}, {"Mn", "Fe"})
         for metal, r0 in ends:
-            self.assertAlmostEqual(r0, expected[metal])
-        self.assertLess(
-            expected["Mn"], _shannon_crystal_radius("Mn", 2, "High Spin", "VI") + o_radius
-        )
+            self.assertAlmostEqual(r0, expected[metal], places=6)
+        iv = _shannon_crystal_radius("Mn", 2, "High Spin", "IV") + o_radius
+        self.assertLess(abs(expected["Mn"] - iv), 0.025)
 
-    def test_eg_orbital_channels_are_octahedral_only(self):
-        self.assertTrue(is_eg_active(ion_descriptor("Cu", 2, "HS", "oct")))
-        self.assertFalse(is_eg_active(ion_descriptor("Cu", 2, "HS", "tet")))
-        self.assertTrue(is_occ_empty_active(ion_descriptor("Mn", 3, "HS", "oct")))
-        self.assertFalse(is_occ_empty_active(ion_descriptor("Fe", 2, "HS", "tet")))
+    def test_level_filling_follows_the_k2_order_inside_each_level(self):
+        """One rule for every d count: full orbitals lowest, then half-filled, then empty, inside each level."""
+        lv = np.array([0.1, -0.2, 0.3, -0.5, 0.5])            # t2g slots 0-2, eg slots 3-4
+        half, empty = level_filling(ion_descriptor("Mn", 3, "HS", "oct"), lv)     # t2g^3 eg^1
+        np.testing.assert_allclose(half, [1, 1, 1, 1, 0]); np.testing.assert_allclose(empty, [0, 0, 0, 0, 1])
+        half, empty = level_filling(ion_descriptor("Cu", 2, "HS", "oct"), lv)     # eg^3: the hole in the upper eg
+        np.testing.assert_allclose(half, [0, 0, 0, 0, 1]); np.testing.assert_allclose(empty, 0)
+        half, empty = level_filling(ion_descriptor("Ti", 3, "HS", "oct"), lv)     # t2g^1: the lowest t2g
+        np.testing.assert_allclose(half, [0, 1, 0, 0, 0]); np.testing.assert_allclose(empty, [1, 0, 1, 1, 1])
+        half, _ = level_filling(ion_descriptor("V", 3, "HS", "oct"), lv)          # t2g^2
+        np.testing.assert_allclose(half, [1, 1, 0, 0, 0])
+        half, _ = level_filling(ion_descriptor("Fe", 2, "HS", "oct"), lv)         # minority t2g electron: lowest
+        np.testing.assert_allclose(half, [1, 0, 1, 1, 1])
+        # degenerate levels share the filling: the shell average
+        half, empty = level_filling(ion_descriptor("Ti", 3, "HS", "oct"), np.array([0.0, 0.0, 0.0, -0.5, 0.5]))
+        np.testing.assert_allclose(half, [1 / 3] * 3 + [0, 0])
+        half, empty = level_filling(ion_descriptor("V", 3, "HS", "oct"), np.array([-0.1, 0.2, 0.2, 0.0, 0.0]))
+        np.testing.assert_allclose(half, [1, 0.5, 0.5, 0, 0]); np.testing.assert_allclose(empty, [0, 0.5, 0.5, 1, 1])
 
 
 class SiteClassValenceTest(unittest.TestCase):
@@ -230,3 +259,83 @@ class SiteClassValenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- continuous level ordering (no oct/tet classification) ----------------------------------------------------
+
+def _cage_structure(directions, r=1.9, element="Co"):
+    from quick_mag.structure import ChemicalStructure
+
+    u = np.asarray(directions, float)
+    u = u / np.linalg.norm(u, axis=1)[:, None]
+    coords = np.vstack([np.zeros(3), r * u])
+    labels = [element] + ["O"] * len(u)
+    return ChemicalStructure(name="cage", lattice=np.eye(3) * 30.0, cartesian_coords=coords, atomic_labels=labels,
+                             magnetic_moments=np.zeros((len(labels), 3)), is_periodic=False)
+
+
+def _flattened_tet(max_angle_deg):
+    t = np.radians(max_angle_deg / 2)
+    s, c = np.sin(t), np.cos(t)
+    return [[s, 0, c], [-s, 0, c], [0, s, -c], [0, -s, -c]]
+
+
+def test_tetrahedral_fraction_of_ideal_and_flattened_cages():
+    from quick_mag.polarization_model import tetrahedral_fraction
+
+    I = np.eye(3)
+    assert tetrahedral_fraction(_cage_structure(np.vstack([I, -I])), 0) == pytest.approx(0.0, abs=1e-9)
+    assert tetrahedral_fraction(_cage_structure(_flattened_tet(109.4712)), 0) == pytest.approx(1.0, abs=1e-6)
+    assert tetrahedral_fraction(_cage_structure(_flattened_tet(180.0)), 0) == pytest.approx(0.11, abs=0.01)
+    xs = [tetrahedral_fraction(_cage_structure(_flattened_tet(a)), 0) for a in np.linspace(109.4712, 180.0, 60)]
+    assert all(b <= a + 1e-9 for a, b in zip(xs, xs[1:]))          # monotonic: tetrahedron -> square plane
+    assert max(abs(b - a) for a, b in zip(xs, xs[1:])) < 0.06       # and continuous
+
+
+def test_coupling_is_continuous_across_the_old_trans_pair_threshold(monkeypatch):
+    """The old rule called a four-coordinate site square planar once an L-M-L cosine fell below -0.7 (134.4 deg)
+    and switched its level ordering there. Two corner-sharing Co3+ cages flattened through that angle now give a
+    coupling that moves smoothly. (D2d puts a k = 4 doublet at the octahedral template's cut here: both choices
+    are averaged, ``crystal_field_bases``.) The field is the cages' own: in a bare two-cage cluster the k = 2 levels
+    inside t2g cross along the path, and an orbital-order switch at a crossing is a step by design."""
+    import quick_mag.polarization_model as PM
+
+    monkeypatch.setattr(PM, "CF_FIELD_CUTOFF", 2.6)
+    from quick_mag.ion_descriptors import ion_descriptor
+    from quick_mag.polarization_model import bridge_J, build_bridges, load_params, DEFAULT_PARAMS_PATH
+    from quick_mag.structure import ChemicalStructure
+
+    params = load_params(DEFAULT_PARAMS_PATH)
+
+    def j_at(angle):
+        u = np.asarray(_flattened_tet(angle), float)
+        u = u / np.linalg.norm(u, axis=1)[:, None]
+        m1, r = np.zeros(3), 1.9
+        o = m1 + r * u[0]
+        m2 = o + r * u[0]                         # second cage through the shared O, mirrored
+        coords = [m1, m2, o] + [m1 + r * v for v in u[1:]] + [m2 - r * v for v in u[1:]]
+        labels = ["Co", "Co"] + ["O"] * 7
+        st = ChemicalStructure(name="pair", lattice=np.eye(3) * 30.0, cartesian_coords=np.array(coords),
+                               atomic_labels=labels, magnetic_moments=np.zeros((9, 3)), is_periodic=False)
+        desc = {0: ion_descriptor("Co", 3, "HS", "oct"), 1: ion_descriptor("Co", 3, "HS", "oct")}
+        (b,) = [b for b in build_bridges(st, desc, valence="site") if b.ligand_index == 2]
+        return bridge_J(b, params)
+
+    js = [j_at(a) for a in np.linspace(128.0, 139.0, 23)]   # the k = 4 levels themselves cross near 140.3 deg
+    steps = np.abs(np.diff(js))
+    assert steps.max() < 1.2 * np.median(steps)
+
+
+def test_a_degenerate_level_at_the_cut_is_averaged():
+    from quick_mag.polarization_model import crystal_field_bases
+
+    st = _cage_structure(_flattened_tet(135.0))
+    oct_choices = crystal_field_bases(st, 0, "oct")
+    assert len(oct_choices) == 2 and sum(w for w, _b, _s in oct_choices) == pytest.approx(1.0)
+    # the averaged eg projector is a function of the cage alone (rotation covariant)
+    def eg_projector(choices):
+        from quick_mag.polarization_model import EG_INDICES
+        return sum(w * b[list(EG_INDICES)].T @ b[list(EG_INDICES)] for w, b, _s in choices)
+    P = eg_projector(oct_choices)
+    assert np.trace(P) == pytest.approx(2.0)
+    assert len(crystal_field_bases(_cage_structure(np.vstack([np.eye(3), -np.eye(3)])), 0, "oct")) == 1

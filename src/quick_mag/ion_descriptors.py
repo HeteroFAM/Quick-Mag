@@ -35,13 +35,12 @@ Hund filling fixes how many orbitals per shell are empty/half/full, but not whic
 named orbital plays which role — every distinct assignment is a degenerate
 microstate (Mn3+ t2g^3 eg^1 has two: the lone eg electron in dz2 or in dx2-y2).
 
-**The exchange model does not currently consume these.** It takes the closed-form
-average over them instead — ``polarization_model.occupancy_vector``, which puts
-H_t2g/3 on each t2g orbital and H_eg/2 on each eg orbital. For degenerate
-microstates that is exactly their mean, so nothing is lost relative to a uniform
-weighting; what is lost is orbital-order information. For eg^1 ions the model
-recovers that from the geometry instead, by picking the occupied eg orbital out of
-a point-charge crystal field (``polarization_model.crystal_field_eg_orbital``).
+**The exchange model does not enumerate these.** It picks the microstate from the
+geometry instead: ``polarization_model.level_filling`` fills each level's full, then
+half-filled, then empty orbitals in the order of a point-charge crystal field (k = 2,
+every ion within ``CF_FIELD_CUTOFF`` at formal charges), and averages orbitals the field
+leaves degenerate -- exactly the mean over those microstates (``occupancy_vector`` is the
+fully degenerate case: H_t2g/3 per t2g orbital, H_eg/2 per eg orbital).
 
 ``enumerate_shell_microstates`` and ``IonDescriptor.microstates`` are kept as the
 hook for per-microstate weighting (Boltzmann weights, or resolving each microstate
@@ -200,8 +199,8 @@ class IonDescriptor:
     ehf_t2g: Tuple[int, int, int]
     ehf_eg: Tuple[int, int, int]
     spin: float
-    # Degenerate Hund microstates. Nothing consumes these yet — the exchange model
-    # uses their average via ``polarization_model.occupancy_vector``; see the
+    # Degenerate Hund microstates. Nothing enumerates these -- the exchange model picks
+    # one from the crystal field (``polarization_model.level_filling``); see the
     # module docstring.
     microstates: List[Microstate] = field(default_factory=list)
     coordination: str = "oct"
@@ -291,21 +290,18 @@ def site_coordination(
     shell_tolerance: float = 1.3,
     trans_dot: float = -0.7,
 ) -> str:
-    """``"tet"`` for a four-coordinate site with no trans ligand pair, else ``"oct"``.
+    """The site's dominant level ordering: ``"tet"`` when its tetrahedral fraction exceeds 1/2, else ``"oct"``.
 
-    Four ligands with no (near-)antiparallel pair is a tetrahedron (ideal
-    L-M-L cosine -1/3); four with trans pairs is square planar, which keeps the
-    octahedral orbital ordering, as do five- and six-coordinate sites. Anything
-    unrecognised falls back to ``"oct"``, the model's original assumption.
+    The fraction (``polarization_model.tetrahedral_fraction``) comes from the sign of the cage's cubic (k = 4)
+    crystal field: ideal octahedron 0, ideal tetrahedron 1, square plane 0.11, a tetrahedron flattened to a
+    137 degree L-M-L angle about 1/2. The exchange model does not use this label -- it mixes both orderings
+    with those weights -- so it only names the site (selectors such as ``Co@tet``, the site-class key of the
+    oxidation fractions) and sets the spin-state default. ``shell_tolerance`` and ``trans_dot`` are accepted
+    for compatibility and unused (they belonged to the earlier four-ligand / trans-pair rule).
     """
-    directions = site_ligand_directions(
-        structure, site_index, ligand_cutoff=ligand_cutoff, shell_tolerance=shell_tolerance
-    )
-    if len(directions) != 4:
-        return "oct"
-    dots = directions @ directions.T
-    np.fill_diagonal(dots, 1.0)
-    return "oct" if float(dots.min()) < trans_dot else "tet"
+    from quick_mag.polarization_model import tetrahedral_fraction
+
+    return "tet" if tetrahedral_fraction(structure, site_index, ligand_cutoff=ligand_cutoff) > 0.5 else "oct"
 
 
 def structure_ion_descriptors(

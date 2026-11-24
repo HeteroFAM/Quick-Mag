@@ -10,6 +10,10 @@
       "dest": "/app/quick_mag/__init__.py"
     },
     {
+      "url": "../src/quick_mag/amplitude_head.py",
+      "dest": "/app/quick_mag/amplitude_head.py"
+    },
+    {
       "url": "../src/quick_mag/analysis.py",
       "dest": "/app/quick_mag/analysis.py"
     },
@@ -62,6 +66,10 @@
       "dest": "/app/quick_mag/defects.py"
     },
     {
+      "url": "../src/quick_mag/direct_exchange.py",
+      "dest": "/app/quick_mag/direct_exchange.py"
+    },
+    {
       "url": "../src/quick_mag/domains.py",
       "dest": "/app/quick_mag/domains.py"
     },
@@ -80,6 +88,18 @@
     {
       "url": "../src/quick_mag/export_utils.py",
       "dest": "/app/quick_mag/export_utils.py"
+    },
+    {
+      "url": "../src/quick_mag/extxyz_io.py",
+      "dest": "/app/quick_mag/extxyz_io.py"
+    },
+    {
+      "url": "../src/quick_mag/fitting.py",
+      "dest": "/app/quick_mag/fitting.py"
+    },
+    {
+      "url": "../src/quick_mag/fitting_h5.py",
+      "dest": "/app/quick_mag/fitting_h5.py"
     },
     {
       "url": "../src/quick_mag/generation.py",
@@ -130,6 +150,10 @@
       "dest": "/app/quick_mag/quick_mag_ui.py"
     },
     {
+      "url": "../src/quick_mag/radial_overlap.py",
+      "dest": "/app/quick_mag/radial_overlap.py"
+    },
+    {
       "url": "../src/quick_mag/radii.py",
       "dest": "/app/quick_mag/radii.py"
     },
@@ -154,8 +178,16 @@
       "dest": "/app/quick_mag/remote/protocol.py"
     },
     {
+      "url": "../src/quick_mag/site_states.py",
+      "dest": "/app/quick_mag/site_states.py"
+    },
+    {
       "url": "../src/quick_mag/sk_table.py",
       "dest": "/app/quick_mag/sk_table.py"
+    },
+    {
+      "url": "../src/quick_mag/solve_output.py",
+      "dest": "/app/quick_mag/solve_output.py"
     },
     {
       "url": "../src/quick_mag/spin_planes.py",

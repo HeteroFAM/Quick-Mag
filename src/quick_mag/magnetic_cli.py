@@ -7,6 +7,13 @@ configurations. The canonical perovskite orderings (G, C, F, A) are always score
 as *reference* configurations, independently of the solver's search, so their
 energies are reported even when the solver does not land on them.
 
+An extended xyz structure may carry the states itself, per atom: an ``oxidation`` column
+(0 = not given) and a ``spin_state`` column (``HS`` / ``LS``). Atoms without one are worked
+out as usual; ``--ox`` / ``--spin`` rules are applied over what the file says.
+
+``--out DIR`` writes the results as files (:mod:`quick_mag.solve_output`) besides printing
+them.
+
 Usage:
     python magnetic_cli.py STRUCTURE.cif [--charge 0] [--top-k 1] ...
 """
@@ -14,13 +21,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shlex
+import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 
 from quick_mag.structure import ChemicalStructure, build_from_generation_parameters
-from quick_mag.structure_utils import read_structure
+from quick_mag.structure_utils import read_structure_frames
+from quick_mag.extxyz_io import (
+    Frame,
+    frame_oxidation_states,
+    frame_site_labels,
+    frame_spin_states,
+)
+from quick_mag.solve_output import AssignmentResult, StructureResult, write_solve_output
 from quick_mag.magnetic_moments import format_oxidation_distribution
 from quick_mag.polarization_model import exchange_model
 from quick_mag.site_states import SiteStates, ranked_assignments
@@ -140,7 +157,9 @@ def _report_spin_states(model) -> None:
     print("  magnetic sites: " + ", ".join(parts))
 
 
-def _run_assignment(structure, assignment, args) -> None:
+def _run_assignment(structure, assignment, args) -> AssignmentResult:
+    """Solve one oxidation assignment: print the report and return what was found."""
+    result = AssignmentResult(assignment=assignment)
     print(f"\n{'=' * 80}")
     print(
         "Oxidation-state assignment:  "
@@ -151,11 +170,13 @@ def _run_assignment(structure, assignment, args) -> None:
     model = exchange_model(structure, assignment, valence=getattr(args, "valence", "class"))
     if not model.sites:
         print("  No transition-metal magnetic sites in this assignment; skipping.")
-        return
+        result.note = "no magnetic sites"
+        return result
     magnetic_site_indices = model.sites
     if not model.bridges:
         print("  No exchange couplings (no M-L-M bridges found); skipping solve.")
-        return
+        result.note = "no exchange couplings"
+        return result
     j_matrix = model.solver_J
     _report_spin_states(model)
 
@@ -167,6 +188,8 @@ def _run_assignment(structure, assignment, args) -> None:
     moments = np.zeros(structure.atom_count)
     moments[magnetic_site_indices] = model.moments
     unit_assignment = replace(assignment, magnetic_moments=moments)
+    result.assignment = unit_assignment
+    result.model = model
 
     # Reference G/C/F/A configurations, in every orientation of the B grid —
     # always reported, independent of the solve.
@@ -174,10 +197,12 @@ def _run_assignment(structure, assignment, args) -> None:
         structure, unit_assignment, j_matrix, magnetic_site_indices, site_indexing
     )
     _report_reference_configs(reference)
+    result.reference = list(reference)
 
     n_mag = len(magnetic_site_indices)
     method = "exact" if n_mag <= args.exact_max_sites else "optimizer"
     print(f"\n  Solving {n_mag} magnetic sites with method='{method}'.")
+    result.method = method
     try:
         _base_states, all_states = solve_for_assignment(
             unit_assignment,
@@ -191,8 +216,18 @@ def _run_assignment(structure, assignment, args) -> None:
     except ValueError as exc:
         if str(exc) == NO_NONZERO_MAGNETIC_MOMENTS_MESSAGE:
             print("  This assignment has no unpaired electrons on any site; nothing to solve.")
-            return
+            result.note = "no unpaired electrons"
+            return result
         raise
+    result.solved = list(all_states)
+    if getattr(args, "out", None) is not None:
+        # Only the written files need a label per configuration; the report labels the
+        # rows it prints itself.
+        written = result.solved if args.max_configs <= 0 else result.solved[: args.max_configs]
+        result.solved_labels = [
+            _label_config(structure, config, magnetic_site_indices, site_indexing)
+            for config in written
+        ]
 
     _report_solved_configs(
         structure, all_states, magnetic_site_indices, site_indexing, args.max_configs
@@ -205,6 +240,7 @@ def _run_assignment(structure, assignment, args) -> None:
         label = _label_config(structure, ground, magnetic_site_indices, site_indexing)
         tag = f" ({label})" if label else ""
         print(f"\n  Ground state (solved + reference): E = {ground.energy:.6f}{tag}")
+    return result
 
 
 SOLVE_DESCRIPTION = (
@@ -218,8 +254,9 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     """Attach the ``solve`` pipeline's arguments to ``parser`` (reused by the CLI)."""
     parser.add_argument(
         "structures", type=Path, nargs="*",
-        help="Structure file(s): .cif (P1) or .vasp/POSCAR. Omit when the "
-        "structures come from an earlier stage of a '::' chain.",
+        help="Structure file(s): .cif (P1), .vasp/POSCAR or extended xyz (.xyz, every "
+        "frame; its 'oxidation' and 'spin_state' columns set the states per atom). Omit "
+        "when the structures come from an earlier stage of a '::' chain.",
     )
     parser.add_argument("--charge", type=int, default=0, help="Net cell charge (default 0).")
     parser.add_argument(
@@ -238,7 +275,7 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument("--n-steps", type=int, default=250, help="Optimizer steps per restart (default 250).")
     parser.add_argument(
         "--max-configs", type=int, default=20,
-        help="Cap on solved configs printed (0 = no cap; default 20).",
+        help="Cap on solved configs printed, and written by --out (0 = no cap; default 20).",
     )
     parser.add_argument(
         "--ox", action="append", default=[], metavar="RULE",
@@ -256,6 +293,16 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         help="'class' (default): a mixed-valent site is the average of its element/"
         "coordination class's states; 'site': each site is the state it was assigned "
         "(use with per-atom --ox pins).",
+    )
+    parser.add_argument(
+        "--ignore-file-states", action="store_true",
+        help="Solve as if an extended xyz input had no 'oxidation' / 'spin_state' columns.",
+    )
+    parser.add_argument(
+        "--out", type=Path, default=None, metavar="DIR",
+        help="Also write the results into DIR: configs.xyz (every configuration as an "
+        "extended xyz frame), sites.csv, exchange.csv, exchange.graphs.json, summary.json "
+        "and chemlab.json, which lists them with their units.",
     )
     return parser
 
@@ -283,18 +330,51 @@ def _provenance_oxidation_constraints(structure: ChemicalStructure) -> dict:
         return {}
 
 
-def solve_structure(structure: ChemicalStructure, args) -> int:
-    """Run the full magnetism pipeline for one structure.
+def _site_states(args, structure: ChemicalStructure, frame: Optional[Frame]):
+    """The ``--ox`` / ``--spin`` rules over the states the structure file carried.
 
-    Oxidation constraints are the builder's sublattice restrictions (spinels) with the
-    user's ``--ox`` rules over them; ``--spin`` rules set spin states per site.
+    Returns the states and how many atoms the file gave an oxidation state / a spin state.
+    """
+    oxidation = getattr(args, "ox", []) or []
+    spin = getattr(args, "spin", []) or []
+    if frame is None or getattr(args, "ignore_file_states", False):
+        return SiteStates.parse(oxidation, spin), 0, 0
+    site_oxidation = frame_oxidation_states(frame)
+    site_spin = frame_spin_states(frame)
+    states = SiteStates.parse(
+        oxidation,
+        spin,
+        site_oxidation=site_oxidation,
+        site_spin=site_spin,
+        labels=frame_site_labels(frame),
+        rules_over_sites=True,
+    )
+    n_oxidation = sum(1 for v in site_oxidation or [] if v is not None)
+    n_spin = sum(1 for v in site_spin or [] if v is not None)
+    return states, n_oxidation, n_spin
+
+
+def solve_structure(structure: ChemicalStructure, args, frame: Optional[Frame] = None) -> int:
+    """Run the full magnetism pipeline for one structure and print its report (0 = solved)."""
+    return 0 if solve_structure_result(structure, args, frame) is not None else 1
+
+
+def solve_structure_result(
+    structure: ChemicalStructure, args, frame: Optional[Frame] = None
+) -> Optional[StructureResult]:
+    """:func:`solve_structure`, returning what was found; ``None`` when it cannot be solved.
+
+    Oxidation constraints are the builder's sublattice restrictions (spinels), then the
+    per-atom states of the structure file (``frame``: an extended xyz ``oxidation`` column),
+    then the user's ``--ox`` rules, each over the one before. Spin states are the file's
+    ``spin_state`` column with the ``--spin`` rules over it.
     """
     labels = structure.element_symbols()
     print(f"Structure: {structure.name}  ({structure.atom_count} atoms)")
     print(f"  elements: {', '.join(sorted(set(labels)))}")
 
     try:
-        states = SiteStates.parse(getattr(args, "ox", []) or [], getattr(args, "spin", []) or [])
+        states, n_file_oxidation, n_file_spin = _site_states(args, structure, frame)
         base = _provenance_oxidation_constraints(structure)
         assignments = ranked_assignments(
             structure, states, charge=args.charge, max_mixing=args.max_mixing,
@@ -302,26 +382,35 @@ def solve_structure(structure: ChemicalStructure, args) -> int:
         )
     except ValueError as exc:
         print(f"Error: {exc}")
-        return 1
+        return None
     if not assignments:
         print("No charge-balanced oxidation-state assignments satisfy the constraints.")
-        return 1
+        return None
     if base:
         print(f"  Sublattice oxidation constraints on {len(base)} atom(s) (builder).")
-    user = states.constraints(structure)
-    if user:
-        print(f"  User oxidation constraints on {len(user)} atom(s) (--ox).")
+    if n_file_oxidation:
+        print(f"  Oxidation states given for {n_file_oxidation} atom(s) (structure file).")
+    if n_file_spin:
+        print(f"  Spin states given for {n_file_spin} atom(s) (structure file).")
+    rules = SiteStates.parse(getattr(args, "ox", []) or [], labels=states.labels).constraints(structure)
+    if rules:
+        print(f"  User oxidation constraints on {len(rules)} atom(s) (--ox).")
     print(f"  Top {len(assignments)} oxidation assignment(s) will be solved.")
+    result = StructureResult(
+        structure=structure, frame=frame,
+        pinned_oxidation=n_file_oxidation, pinned_spin=n_file_spin,
+    )
     for assignment in assignments:
-        _run_assignment(structure, assignment, args)
-    return 0
+        result.assignments.append(_run_assignment(structure, assignment, args))
+    return result
 
 
 def run_solve(args, structures=None) -> int:
     """Solve every structure named on the command line, or handed over by a chain.
 
     ``solve`` is always the last stage of a ``::`` chain — spin data feeds nothing
-    else — so it writes no structures and simply reports.
+    else — so it writes no structures; it reports, and with ``--out`` writes its
+    results as files.
     """
     if structures is None:
         if not args.structures:
@@ -330,13 +419,37 @@ def run_solve(args, structures=None) -> int:
                 "chain solve after a build/chgnet stage with '::'."
             )
             return 1
-        structures = [read_structure(path) for path in args.structures]
+        frames: List[Frame] = []
+        for path in args.structures:
+            try:
+                frames.extend(read_structure_frames(path))
+            except (OSError, ValueError) as exc:
+                print(f"Error: {path}: {exc}")
+                return 1
+    else:
+        frames = [Frame(structure=structure) for structure in structures]
 
     status = 0
-    for index, structure in enumerate(structures):
+    results: List[StructureResult] = []
+    for index, frame in enumerate(frames):
         if index:
             print()
-        status = solve_structure(structure, args) or status
+        # Only an extended xyz frame carries per-atom columns; an empty one says nothing.
+        carried = frame if (frame.arrays or frame.info) else None
+        result = solve_structure_result(frame.structure, args, carried)
+        if result is None:
+            status = 1
+        else:
+            results.append(result)
+
+    out_dir = getattr(args, "out", None)
+    if out_dir is not None and results:
+        manifest = write_solve_output(
+            Path(out_dir).expanduser(), results,
+            max_configs=args.max_configs,
+            command="quick-mag " + " ".join(shlex.quote(a) for a in sys.argv[1:]),
+        )
+        print(f"\nWrote results -> {manifest.parent} ({manifest.name} lists them)")
     return status
 
 

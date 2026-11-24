@@ -5,9 +5,10 @@ There is no per-element amplitude in the kernel. Each bridge end's sigma and pi 
     a_m = exp(sum_f theta_m[f] * phi_f(ion)),      m = sigma, pi
 
 with ``phi`` the centred features below: the ion's own descriptors (charge, d filling, spin, d-shell compactness,
-charge-transfer energy) and one of its ligand cage, ``ln_cn`` = ln(CN / 6) with CN a smooth count of its ligands
-(:func:`site_environment`) -- continuous, so a tetrahedron (ln 4/6), a square pyramid (ln 5/6), an octahedron (0) or
-anything between are told apart by geometry rather than by a label. Nothing is fitted per structure or per element.
+charge-transfer energy) and two of its ligand cage (:func:`site_environment`), both continuous in the geometry:
+``ln_cn`` = ln(CN / 6) with CN a smooth count of its ligands, and ``ln_nsig`` = ln(N_sigma / 3) with N_sigma the
+number of ligands an average sigma-bonding d orbital bonds to (below). A count cannot tell a square plane from a
+tetrahedron (CN 4 both); N_sigma can (2.5 vs 4/3). Nothing is fitted per structure or per element.
 Bond lengths enter through the range factor, bond by bond. (Weighted Steinhardt invariants of the cage were tried and
 removed 2026-11-17: on every magnetic site in the fit data they never moved; a binary ``tet`` label was used briefly
 in place of ``ln_cn`` and replaced by it the same day.)
@@ -23,7 +24,7 @@ from typing import Dict
 import numpy as np
 
 __all__ = ["DELTA", "DELTA_FILLED", "ln_delta", "FEATURES", "ION_FEATURES", "ENV_FEATURES", "ion_features",
-           "site_environment", "head_factors"]
+           "site_environment", "sigma_load", "head_factors"]
 
 ION_FEATURES = (
     "charge",      # oxidation state - 3
@@ -37,10 +38,24 @@ ION_FEATURES = (
 # the Shannon distance) falling smoothly to 0 at SWITCH[1] x R0. A count rather than an overlap weight, because bond
 # lengths are already the range factor's, bond by bond (an overlap weight counts them twice: tested, it transfers
 # worse). Centred on the octahedron: ln_cn = ln(CN / 6); -2 ln_cn on sigma would be bond-valence (6/CN)^2.
-ENV_FEATURES = ("ln_cn",)
+#
+# ``ln_nsig``: the cage's sigma Gram matrix over the d shell, G_ab = sum_L w_L A_a(u_L) A_b(u_L) (A = sk_table's sigma
+# angular factors, w_L the same smooth bond weights), has trace CN and its eigenvalues are the angular-overlap sigma
+# loads of the five d orbitals (octahedron eg 3, 3; tetrahedron t2 4/3 x 3; square plane x2-y2 3, z2 1). Their
+# load-weighted mean N_sigma = tr G^2 / tr G is how many ligands a sigma orbital's covalency is shared over; with
+# sum_a A_a(u) A_a(u') = P2(u.u') it is a pair sum over the cage,
+#     N_sigma = sum_LL' w_L w_L' P2(u_L . u_L')^2 / sum_L w_L = CN [(18/35) q4^2 + (2/7) q2^2 + 1/5]
+# (q_l the w-weighted Steinhardt invariants), so it is rotation invariant and needs no local frame or orbital labels.
+# Octahedron 3 (ln_nsig = 0), square pyramid 2.6, square plane 2.5, trigonal bipyramid 2.02, trigonal prism 1.80,
+# tetrahedron 4/3. Weight -1 on sigma (the derived value: an orbital's sigma covalency shared over N_sigma ligands,
+# a_sigma = 3 / N_sigma) gives 2.25 for a tetrahedron, against (6/4)^2.17 = 2.41 from the fitted ln_cn weight, and
+# 1.20 for a square plane, where ln_cn gave the tetrahedral 2.41.
+ENV_FEATURES = ("ln_cn", "ln_nsig")
 FEATURES = ION_FEATURES + ENV_FEATURES
 SWITCH = (1.25, 1.45)
 NOMINAL_CN = {"oct": 6.0, "tet": 4.0}
+NOMINAL_NSIG = {"oct": 3.0, "tet": 4.0 / 3.0}
+NSIG_REF = 3.0                           # the octahedron's N_sigma: ln_nsig = 0
 
 # The charge-transfer energy Delta (O 2p -> metal 3d), per ion. In a charge-transfer oxide an end's ligand
 # polarization goes as t^2 / Delta, so a pair's superexchange as t^4 / (Delta_i Delta_j U): the ``ln_delta`` feature
@@ -123,7 +138,8 @@ def ion_features(descriptor, env: np.ndarray = None) -> np.ndarray:
         float(descriptor.n_eg) - 1.5,
         lnz,
         ln_delta(descriptor.element, descriptor.oxidation_state),
-        *(np.array([np.log(NOMINAL_CN.get(descriptor.coordination, 6.0) / 6.0)]) if env is None else env),
+        *(np.array([np.log(NOMINAL_CN.get(descriptor.coordination, 6.0) / 6.0),
+                    np.log(NOMINAL_NSIG.get(descriptor.coordination, NSIG_REF) / NSIG_REF)]) if env is None else env),
     ])
 
 
@@ -132,21 +148,41 @@ def _smoothstep_down(x, lo, hi):
     return 1.0 - t * t * (3.0 - 2.0 * t)
 
 
+def sigma_load(directions: np.ndarray, weights: np.ndarray) -> float:
+    """N_sigma of a cage: ``sum_LL' w_L w_L' P2(u_L . u_L')^2 / sum_L w_L`` for ligand directions (n, 3) and bond
+    weights (n,) -- the load-weighted mean eigenvalue of the cage's sigma Gram matrix (see ``ENV_FEATURES``).
+    Floored at 1 (one ligand); 0 ligands give the reference NSIG_REF."""
+    w = np.asarray(weights, dtype=float)
+    if w.size == 0 or w.sum() < 1e-6:
+        return NSIG_REF
+    u = np.asarray(directions, dtype=float)
+    u = u / np.linalg.norm(u, axis=1)[:, None]
+    p2 = 1.5 * (u @ u.T) ** 2 - 0.5
+    return max(float(w @ (p2 * p2) @ w / w.sum()), 1.0)
+
+
 def site_environment(structure, site: int, element: str, states, spin_state: str, coordination: str,
                      *, cutoff: float = 3.0) -> np.ndarray:
-    """``ENV_FEATURES`` of one metal site: ln(CN / 6), CN the smooth count of its ligands. ``states`` are the site's
-    (oxidation state, weight) pairs (they set R0). A site with no ligand in reach counts CN = 1 (the floor keeps a
-    stray geometry from sending the amplitude to infinity)."""
+    """``ENV_FEATURES`` of one metal site: ln(CN / 6), CN the smooth count of its ligands, and ln(N_sigma / 3)
+    (:func:`sigma_load`) over the same smooth bond weights. ``states`` are the site's (oxidation state, weight)
+    pairs and ``coordination`` the Shannon reference they set the switch's R0 by; ``build_bridges`` passes "oct"
+    (VI) for every site, since its R0 is that length plus the bond-valence shift of this CN. A site with no ligand in reach counts CN = 1 (the floor keeps a stray geometry from
+    sending the amplitude to infinity) and N_sigma = 3."""
     from quick_mag.polarization_model import ANION_SPECIES, r0_metal_ligand_averaged
 
     symbols = structure.element_symbols()
     nbrs = [n for n in structure.neighbors(site, cutoff) if symbols[n.index] in ANION_SPECIES and n.nn_distance > 1e-8]
-    S = 0.0
+    center = structure.cartesian_coords[site]
+    w, u = [], []
     for ligand in {symbols[n.index] for n in nbrs}:
-        r = np.array([n.nn_distance for n in nbrs if symbols[n.index] == ligand])
+        mine = [n for n in nbrs if symbols[n.index] == ligand]
+        r = np.array([n.nn_distance for n in mine])
         r0 = r0_metal_ligand_averaged(element, tuple(states), spin_state, ligand, coordination)
-        S += float(_smoothstep_down(r / r0, *SWITCH).sum())
-    return np.array([np.log(max(S, 1.0) / 6.0)])
+        w.extend(_smoothstep_down(r / r0, *SWITCH))
+        u.extend(np.asarray(n.coords, dtype=float) - center for n in mine)
+    S = float(np.sum(w)) if w else 0.0
+    nsig = sigma_load(np.array(u).reshape(-1, 3), np.array(w))
+    return np.array([np.log(max(S, 1.0) / 6.0), np.log(nsig / NSIG_REF)])
 
 
 def head_weights(table: Dict[str, float]) -> np.ndarray:

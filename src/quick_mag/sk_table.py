@@ -42,21 +42,27 @@ D_ORBITAL_TENSORS: np.ndarray = np.stack(
 )
 
 
-def pd_amplitudes(
-    u: np.ndarray, rotation: Optional[np.ndarray] = None
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Signed SK pd amplitudes of all five d orbitals for bond direction ``u``.
+def orbital_tensors(basis: Optional[np.ndarray] = None) -> np.ndarray:
+    """(5, 3, 3) quadrupole tensors of a site's d orbitals: ``D_ORBITAL_TENSORS`` (the global real d orbitals), or
+    the orbitals ``basis`` (5, 5; rows = orbitals as coefficients on the global ones, orthonormal)."""
+    if basis is None:
+        return D_ORBITAL_TENSORS
+    return np.einsum("ab,bij->aij", np.asarray(basis, dtype=float), D_ORBITAL_TENSORS)
 
-    ``u`` must be a unit vector in the global frame. ``rotation`` optionally
-    rotates the d-orbital frame (site local frame -> global): ``Q -> R Q R^T``.
+
+def pd_amplitudes(
+    u: np.ndarray, basis: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Signed SK pd amplitudes of a site's five d orbitals for bond direction ``u``.
+
+    ``u`` must be a unit vector in the global frame. ``basis`` (5, 5) gives the site's
+    orbitals as rows of coefficients on the global real d orbitals (None = those
+    themselves); see ``polarization_model.crystal_field_basis``.
     Returns ``(A_sigma, t_pi)`` with shapes ``(5,)`` and ``(5, 3)``; ``t_pi`` rows
     are perpendicular to ``u``.
     """
     u = np.asarray(u, dtype=float)
-    tensors = D_ORBITAL_TENSORS
-    if rotation is not None:
-        rotation = np.asarray(rotation, dtype=float)
-        tensors = np.einsum("ab,nbc,dc->nad", rotation, tensors, rotation)
+    tensors = orbital_tensors(basis)
     qu = tensors @ u                          # (5, 3)
     uqu = qu @ u                              # (5,)
     a_sigma = math.sqrt(1.5) * uqu
@@ -67,7 +73,7 @@ def pd_amplitudes(
 def channel_weights(
     u: np.ndarray,
     frame: np.ndarray,
-    rotation: Optional[np.ndarray] = None,
+    basis: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Squared (intensity) channel weights of each d orbital on the p frame.
 
@@ -82,7 +88,7 @@ def channel_weights(
     frame-independent (= A_sigma^2 + |t_pi|^2).
     """
     frame = np.asarray(frame, dtype=float)
-    a_sigma, t_pi = pd_amplitudes(u, rotation=rotation)
+    a_sigma, t_pi = pd_amplitudes(u, basis=basis)
     c = frame @ np.asarray(u, dtype=float)    # (3,) components of u on the frame
     w_sigma = np.outer(a_sigma, c) ** 2
     w_pi = (t_pi @ frame.T) ** 2

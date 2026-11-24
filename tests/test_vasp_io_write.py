@@ -177,7 +177,7 @@ class ExportFormatTest(unittest.TestCase):
     def test_unknown_format_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
-                export_structure(_ungrouped(), Path(tmp), formats=("xyz",))
+                export_structure(_ungrouped(), Path(tmp), formats=("pdb",))
 
     def test_summary_counts_both_geometries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,7 +194,7 @@ class ExportFormatTest(unittest.TestCase):
         self.assertEqual(
             export_options(_Args()), {"formats": ("cif", "vasp"), "group_species": True}
         )
-        self.assertEqual(set(FORMAT_CHOICES), {"cif", "vasp", "both"})
+        self.assertEqual(set(FORMAT_CHOICES), {"cif", "vasp", "both", "xyz"})
         # The default stays CIF-only, so existing callers are unaffected.
         self.assertEqual(
             export_options(object()), {"formats": ("cif",), "group_species": False}

@@ -21,7 +21,7 @@ import re
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,8 +31,10 @@ from quick_mag.vasp_io import grouped_by_species, write_poscar
 
 
 #: Structure formats ``export_structure`` can write. ``"cif"`` writes
-#: ``<stem>.cif``, ``"vasp"`` writes ``<stem>.vasp`` (a POSCAR).
-STRUCTURE_FORMATS = ("cif", "vasp")
+#: ``<stem>.cif``, ``"vasp"`` writes ``<stem>.vasp`` (a POSCAR), ``"xyz"`` writes
+#: ``<stem>.xyz`` (extended xyz: the cell, the signed moments and the builder's
+#: provenance in one file, in the structure's own atom order).
+STRUCTURE_FORMATS = ("cif", "vasp", "xyz")
 DEFAULT_STRUCTURE_FORMATS = ("cif",)
 
 #: The CLI's ``--format`` values, each mapping to ``export_structure`` keywords.
@@ -43,10 +45,12 @@ FORMAT_CHOICES = {
     "cif": {"formats": ("cif",), "group_species": False},
     "vasp": {"formats": ("vasp",), "group_species": True},
     "both": {"formats": ("cif", "vasp"), "group_species": True},
+    "xyz": {"formats": ("xyz",), "group_species": False},
 }
 
 FORMAT_HELP = (
-    "Geometry file(s) to write: 'cif' (default), 'vasp' for a POSCAR, or 'both'. "
+    "Geometry file(s) to write: 'cif' (default), 'vasp' for a POSCAR, 'both', or 'xyz' "
+    "for extended xyz (keeps the atom order, the moments and any per-atom columns). "
     "Any 'vasp' output groups the atoms into one block per element, which reorders "
     "them; the CIF and the magmom file written alongside follow the same order."
 )
@@ -125,8 +129,13 @@ def export_structure(
     *,
     formats: Sequence[str] = DEFAULT_STRUCTURE_FORMATS,
     group_species: bool = False,
+    xyz_info: Optional[Dict[str, object]] = None,
+    xyz_arrays: Optional[Dict[str, object]] = None,
 ) -> Dict[str, int]:
     """Write one structure's geometry and (when present) ``<stem>_spins.txt``.
+
+    ``xyz_info`` / ``xyz_arrays`` are comment-line keys and per-atom columns for the
+    ``"xyz"`` format only (an energy, forces, the columns the input file carried).
 
     ``formats`` selects the geometry files: ``"cif"`` for ``<stem>.cif``, ``"vasp"``
     for ``<stem>.vasp`` (a POSCAR), or both. Whatever is written comes out in one
@@ -148,13 +157,19 @@ def export_structure(
         structure = grouped_by_species(structure)
 
     stem = sanitize_filename(structure.name)
-    written = {"cif": 0, "vasp": 0}
+    written = {"cif": 0, "vasp": 0, "xyz": 0}
     if "cif" in formats:
         write_cif(structure, out_dir / f"{stem}.cif")
         written["cif"] = 1
     if "vasp" in formats:
         write_poscar(structure, out_dir / f"{stem}.vasp", comment=structure.name)
         written["vasp"] = 1
+    if "xyz" in formats:
+        from quick_mag.extxyz_io import write_extxyz
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_extxyz(out_dir / f"{stem}.xyz", structure, info=xyz_info, arrays=xyz_arrays)
+        written["xyz"] = 1
 
     configs = list(getattr(structure, "spin_configurations", []) or [])
     if configs:
@@ -184,7 +199,7 @@ def export_structures(
     """
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
-    summary = {"structures": 0, "cif": 0, "vasp": 0, "spin_configs": 0}
+    summary = {"structures": 0, "cif": 0, "vasp": 0, "xyz": 0, "spin_configs": 0}
     for structure in structures:
         result = export_structure(
             structure, target, formats=formats, group_species=group_species
@@ -192,6 +207,7 @@ def export_structures(
         summary["structures"] += 1
         summary["cif"] += result["cif"]
         summary["vasp"] += result["vasp"]
+        summary["xyz"] += result["xyz"]
         summary["spin_configs"] += result["spin_configs"]
     return summary
 

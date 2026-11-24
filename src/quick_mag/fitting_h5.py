@@ -141,12 +141,16 @@ def load_h5_systems(
 
     path = Path(path)
     key = None
+
+    def _cache_tag():
+        from quick_mag.polarization_model import N_TSETS
+        return f"T-v12-{N_TSETS}"
     if cache:
         st = path.stat()
         # the head features are pickled in the systems: their definition is part of the key
         feats = (FEATURES, tuple(sorted(DELTA.items())))
         opts = repr((str(path.resolve()), st.st_size, st.st_mtime, states, tuple(map(lambda s: tuple(s) if s else s, spin_options)),
-                     top_k, valence, max_moment_dev, max_span, min_configs, energy, feats, "T-v3"))
+                     top_k, valence, max_moment_dev, max_span, min_configs, energy, feats, _cache_tag()))
         key = hashlib.sha1(opts.encode()).hexdigest()[:16]
         cpath = Path(cache) / f"{path.stem}-{key}.pkl"
         if cpath.exists():

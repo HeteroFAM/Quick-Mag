@@ -1,7 +1,7 @@
 """Fitting the exchange-polarization model's atomic parameters to collinear DFT energies.
 
 Every coupling stays a function of atomic parameters (``PolarizationParameters``: w and J_H per
-ligand, gamma_pi, the amplitude head's weights on ion descriptors, the range law's alpha / n,
+ligand, gamma_pi, the amplitude head's weights on ion descriptors, the range law's n / delta_sat,
 t_de and j_fm) and the geometry -- the fit moves those, never a pair J -- so what it learns
 transfers to structures it has not seen.
 
@@ -23,9 +23,8 @@ leak into the fit (filter configurations whose moments changed before building s
 Parameters and stages
 ---------------------
 :class:`ParamSpec` names the free parameters (``"w[O]"``, ``"jh[O]"``, ``"gamma_pi"``, ``"k_dd"``, ``"k_ee"``,
-``"head_sigma[ln_cn]"``, ``"head_pi[*]"``, ``"alpha[*]"`` = one shared alpha for every metal of the
-data, ...); everything else is held at the base parameter set. An exact gauge is never free: the
-ligand alpha when the data has one ligand (only sqrt(alpha_M alpha_L) enters). A staged fit is a
+``"head_sigma[ln_cn]"``, ``"head_pi[*]"``, ``"n[*]"`` = one shared exponent for every metal of the
+data, ``"delta_sat"``, ...); everything else is held at the base parameter set. A staged fit is a
 sequence of specs, each starting from the last one's result (:func:`fit_staged`).
 
 Diagnostics (:func:`diagnose`): energy RMSE (meV/site), ground-state match rate and mean
@@ -47,6 +46,8 @@ from quick_mag.polarization_model import (
     ExchangeModel,
     PolarizationParameters,
     default_params,
+    N_TSETS,
+    T_EE,
 )
 
 __all__ = [
@@ -88,8 +89,6 @@ class FitSystem:
     dr_j: np.ndarray
     rr_i: np.ndarray           # r_iL / R0_iL
     rr_j: np.ndarray
-    sto_i: np.ndarray          # (n_bridges, 2): frozen STO (sigma, pi) damping
-    sto_j: np.ndarray
     feat_i: np.ndarray         # (n_bridges, F): amplitude-head features of each end's ion
     feat_j: np.ndarray
     Bsig_i: np.ndarray
@@ -111,11 +110,10 @@ class FitSystem:
     # (n_bridges, 3, 3, 3, 3): ``BridgeGeometry.T`` of each end (the coherent kernel and the empty-empty term)
     T_i: Optional[np.ndarray] = None
     T_j: Optional[np.ndarray] = None
-    amp0_i: Optional[np.ndarray] = None   # (n_bridges, 2): absolute STO amplitudes at R0 (range models "*_abs")
-    amp0_j: Optional[np.ndarray] = None
     G_dx: Optional[np.ndarray] = None     # (n_bridges, 4): direct-exchange interference geometry (0 beyond the cutoff)
     ie_i: Optional[np.ndarray] = None     # (n_bridges, 3): (IE_{q+1}, IE_q, q) of each end (oe_rule "ionization")
     ie_j: Optional[np.ndarray] = None
+    de_env1: Optional[np.ndarray] = None  # |cos(theta)| * de_weight on DE-active bridges (de_form "linear")
 
     @property
     def elements(self) -> set:
@@ -195,8 +193,6 @@ def fit_system(
         dr_j=np.array([b.r_jL - b.R0_jL for b in bridges], dtype=float),
         rr_i=np.array([b.r_iL / b.R0_iL for b in bridges], dtype=float),
         rr_j=np.array([b.r_jL / b.R0_jL for b in bridges], dtype=float),
-        sto_i=np.array([b.sto_i for b in bridges], dtype=float).reshape(len(bridges), 2),
-        sto_j=np.array([b.sto_j for b in bridges], dtype=float).reshape(len(bridges), 2),
         feat_i=np.array([b.feat_i for b in bridges], dtype=float).reshape(len(bridges), -1),
         feat_j=np.array([b.feat_j for b in bridges], dtype=float).reshape(len(bridges), -1),
         Bsig_i=arr(lambda b: b.Bsig_i),
@@ -215,15 +211,14 @@ def fit_system(
         Bpi_emp_j=arr(lambda b: b.Bpi_emp_j if b.oe_active else zeros),
         labels=list(labels),
         dd=None if getattr(model, "dd", None) is None else np.array(model.dd, dtype=float),
-        T_i=(np.array([b.T_i for b in bridges], dtype=float).reshape(len(bridges), 3, 3, 3, 3)
+        T_i=(np.array([b.T_i for b in bridges], dtype=float).reshape(len(bridges), N_TSETS, 3, 3, 3)
              if all(b.T_i is not None for b in bridges) else None),
-        T_j=(np.array([b.T_j for b in bridges], dtype=float).reshape(len(bridges), 3, 3, 3, 3)
+        T_j=(np.array([b.T_j for b in bridges], dtype=float).reshape(len(bridges), N_TSETS, 3, 3, 3)
              if all(b.T_j is not None for b in bridges) else None),
-        amp0_i=np.array([b.amp0_i for b in bridges], dtype=float).reshape(len(bridges), 2),
-        amp0_j=np.array([b.amp0_j for b in bridges], dtype=float).reshape(len(bridges), 2),
         G_dx=np.array([np.zeros(4) if b.G_dx is None else b.G_dx for b in bridges], dtype=float).reshape(len(bridges), 4),
         ie_i=np.array([b.ie_i for b in bridges], dtype=float).reshape(len(bridges), 3),
         ie_j=np.array([b.ie_j for b in bridges], dtype=float).reshape(len(bridges), 3),
+        de_env1=np.array([abs(b.cos_theta) * b.de_weight if b.de_active else 0.0 for b in bridges]),
     )
 
 
@@ -238,29 +233,16 @@ def _lookup(table: Dict[str, float], default: float, keys: np.ndarray) -> np.nda
 
 def _damping(system: FitSystem, params: PolarizationParameters, end: str):
     """(d_sigma, d_pi) per bridge for one end, as ``polarization_model.end_damping``."""
-    metal = getattr(system, f"metal_{end}")
-    model = params.range_model
-    if model.endswith("_abs"):
-        ds, dp = _damping(system, replace(params, range_model=model[:-4]), end)
-        a0 = getattr(system, f"amp0_{end}")
-        return (ds, dp) if a0 is None else (ds * a0[:, 0], dp * a0[:, 1])
-    if model == "exp":
-        a = np.sqrt(_lookup(params.alpha, params.alpha_default, metal)
-                    * _lookup(params.alpha, params.alpha_default, system.ligand))
-        d = np.exp(-a * getattr(system, f"dr_{end}"))
-        return d, d
-    if model == "power":
-        n = _lookup(params.range_power, params.range_power_default, metal)
-        if params.n_delta:
-            from quick_mag.amplitude_head import FEATURES
+    from quick_mag.amplitude_head import FEATURES
+    from quick_mag.polarization_model import range_exponent
 
-            n = n + params.n_delta * getattr(system, f"feat_{end}")[:, FEATURES.index("ln_delta")]
-        d = getattr(system, f"rr_{end}") ** (-n)
-        return d, d
-    if model == "sto":
-        sto = getattr(system, f"sto_{end}")
-        return sto[:, 0], sto[:, 1]
-    raise ValueError(f"range_model must be exp, power or sto, got {model!r}")
+    ln_delta = getattr(system, f"feat_{end}")[:, FEATURES.index("ln_delta")]
+    if params.delta_sat > 0.0:
+        n = range_exponent(params, None, ln_delta)
+    else:
+        n = _lookup(params.range_power, params.range_power_default, getattr(system, f"metal_{end}")) + params.n_delta * ln_delta
+    d = getattr(system, f"rr_{end}") ** (-n)
+    return d, d
 
 
 def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarray:
@@ -276,10 +258,6 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
         hs_j, hp_j = head_factors(params, system.feat_j)
         ds_i, dp_i, ds_j, dp_j = ds_i * hs_i, dp_i * hp_i, ds_j * hs_j, dp_j * hp_j
     g2 = params.gamma_pi ** 2
-    if params.k_sat:
-        ks = params.k_sat
-        ds_i, dp_i = ds_i / (1.0 + ks * ds_i), dp_i / (1.0 + ks * g2 * dp_i)
-        ds_j, dp_j = ds_j / (1.0 + ks * ds_j), dp_j / (1.0 + ks * g2 * dp_j)
     if params.kernel not in ("coherent", "diagonal"):
         raise ValueError(f"kernel must be coherent or diagonal, got {params.kernel!r}")
     from quick_mag.polarization_model import end_polarization
@@ -300,8 +278,10 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
         mu_j = ds_j * system.Bsig_j + g2 * dp_j * system.Bpi_j
         j = 2.0 * (w + jh) * np.einsum("bp,bp->b", mu_i, mu_j) - 2.0 * jh * mu_i.sum(1) * mu_j.sum(1)
     if params.k_ee and have_T:
-        E_i = end_polarization(system.T_i[:, 2], fs_i, fp_i, coherent)
-        E_j = end_polarization(system.T_j[:, 2], fs_j, fp_j, coherent)
+        from quick_mag.polarization_model import T_EE
+
+        E_i = end_polarization(system.T_i[:, T_EE[params.ee_spin]], fs_i, fp_i, coherent)
+        E_j = end_polarization(system.T_j[:, T_EE[params.ee_spin]], fs_j, fp_j, coherent)
         j = j + 2.0 * (w + jh) * params.k_ee ** 2 * np.einsum("bpq,bpq->b", E_i, E_j)
     if params.k_dx and system.G_dx is not None:
         amp = np.sqrt(np.stack([fs_i * fs_j, fs_i * fp_j, fp_i * fs_j, fp_i * fp_j], axis=1))
@@ -309,7 +289,13 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
     if np.any(system.de_env):
         t = (_lookup(params.t_de, params.t_de_default, system.metal_i)
              * _lookup(params.t_de, params.t_de_default, system.metal_j))
-        j = j - t * damp_i * damp_j * system.de_env
+        if params.de_form not in ("linear", "quadratic"):
+            raise ValueError(f"de_form must be linear or quadratic, got {params.de_form!r}")
+        if params.de_form == "linear":
+            env1 = system.de_env1 if system.de_env1 is not None else np.sqrt(system.de_env)
+            j = j - t * np.sqrt(fs_i * fs_j) * env1
+        else:
+            j = j - t * damp_i * damp_j * system.de_env
     if np.any(system.oe_env):
         jf = (_lookup(params.j_fm, params.j_fm_default, system.metal_i)
               * _lookup(params.j_fm, params.j_fm_default, system.metal_j))
@@ -338,9 +324,9 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
                 c_i = _lookup(params.j_fm, params.j_fm_default, system.metal_i)[:, None, None]
                 c_j = _lookup(params.j_fm, params.j_fm_default, system.metal_j)[:, None, None]
                 X_i = (c_i * end_polarization(system.T_i[:, 1], fs_i, fp_i, coherent)
-                       + params.k_oe * end_polarization(system.T_i[:, 2], fs_i, fp_i, coherent))
+                       + params.k_oe * end_polarization(system.T_i[:, T_EE[params.ee_spin]], fs_i, fp_i, coherent))
                 X_j = (c_j * end_polarization(system.T_j[:, 1], fs_j, fp_j, coherent)
-                       + params.k_oe * end_polarization(system.T_j[:, 2], fs_j, fp_j, coherent))
+                       + params.k_oe * end_polarization(system.T_j[:, T_EE[params.ee_spin]], fs_j, fp_j, coherent))
                 overlap = 2.0 * (w + jh) * (np.einsum("bpq,bpq->b", H_i, X_j) + np.einsum("bpq,bpq->b", X_i, H_j))
             jf = 1.0
         elif coherent:
@@ -354,6 +340,10 @@ def j_eff_matrix(system: FitSystem, params: PolarizationParameters) -> np.ndarra
             me_j = ds_j * system.Bsig_emp_j + g2 * dp_j * system.Bpi_emp_j
             overlap = np.einsum("bp,bp->b", mo_i, me_j) + np.einsum("bp,bp->b", me_i, mo_j)
         j = j - jf * system.oe_env * overlap
+    if params.t2g_oe != "off" and have_T:
+        from quick_mag.polarization_model import t2g_oe_term
+
+        j = j + t2g_oe_term(params, w, jh, system.T_i, system.T_j, fs_i, fp_i, fs_j, fp_j, coherent)
     out = np.zeros((system.n_sites, system.n_sites))
     np.add.at(out, (system.idx_i, system.idx_j), j)
     np.add.at(out, (system.idx_j, system.idx_i), j)
@@ -373,7 +363,6 @@ def predict(system: FitSystem, params: PolarizationParameters) -> np.ndarray:
 # ---------------------------------------------------------------------------------------
 
 _FIELDS = {
-    "alpha": ("alpha", "alpha_default"),
     "w": ("w_ligand", "w_default"),
     "jh": ("jh_ligand", "jh_default"),
     "t_de": ("t_de", "t_de_default"),
@@ -382,10 +371,9 @@ _FIELDS = {
     "head_sigma": ("head_sigma", None),
     "head_pi": ("head_pi", None),
 }
-_SCALARS = ("gamma_pi", "k_dd", "k_ee", "k_oe", "k_dx", "k_sat", "n_delta", "oe_decay", "oe_charge")      # parameters that are one number, not a table
+_SCALARS = ("gamma_pi", "k_dd", "k_ee", "k_oe", "k_t2g", "k_dx", "n_delta", "delta_sat", "oe_decay", "oe_charge")      # parameters that are one number, not a table
 # (lower, upper, prior scale as a fraction of |prior|, floor of the scale)
 _BOUNDS = {
-    "alpha": (0.1, 8.0, 0.5, 0.5),
     "w": (1e-4, 10.0, 0.5, 0.005),
     "jh": (0.0, 10.0, 0.5, 0.002),
     "t_de": (0.0, 3.0, 0.5, 0.05),
@@ -394,9 +382,10 @@ _BOUNDS = {
     "k_dd": (0.0, 50.0, 0.5, 0.1),
     "k_ee": (0.0, 5.0, 0.5, 0.1),
     "k_oe": (0.0, 5.0, 0.5, 0.1),
+    "k_t2g": (0.0, 20.0, 0.5, 0.5),
     "k_dx": (-50.0, 50.0, 0.5, 0.1),
-    "k_sat": (0.0, 20.0, 0.5, 0.2),
     "n_delta": (-20.0, 20.0, 0.5, 1.0),
+    "delta_sat": (0.5, 40.0, 0.5, 1.0),
     "oe_decay": (0.2, 30.0, 0.5, 0.5),
     "oe_charge": (0.0, 40.0, 0.5, 3.0),
     "n": (0.0, 30.0, 0.5, 2.0),
@@ -407,8 +396,8 @@ _BOUNDS = {
 
 @dataclass
 class _Free:
-    name: str                    # as written: "w[O]", "alpha[*]", "head_pi[n_eg]", "gamma_pi"
-    kind: str                    # w / jh / alpha / head_sigma / ... / gamma_pi
+    name: str                    # as written: "w[O]", "n[*]", "head_pi[n_eg]", "gamma_pi"
+    kind: str                    # w / jh / n / head_sigma / ... / gamma_pi
     targets: Tuple[str, ...]     # elements it sets (empty for gamma_pi)
 
 
@@ -418,9 +407,9 @@ class ParamSpec:
 
     ``free``: names like ``"w[O]"``, ``"jh[*]"`` (one per ligand of the data), ``"gamma_pi"``,
     ``"head_sigma[ln_cn]"``, ``"head_pi[*]"`` (one per amplitude-head feature), ``"t_de[Mn]"``,
-    ``"alpha[*]"`` / ``"n[*]"`` (*one* shared range parameter for every metal: tied). Glob
-    patterns expand against ``systems``; ``alpha[*]`` and ``n[*]`` are the exceptions, ties, as
-    the data rarely separates per-metal ranges (use ``alpha[Fe]`` etc. to free one alone).
+    ``"n[*]"`` (*one* shared range exponent for every metal: tied). Glob
+    patterns expand against ``systems``; ``n[*]`` is the exception, a tie, as
+    the data rarely separates per-metal ranges (use ``n[Fe]`` etc. to free one alone).
     ``base``: the parameter set everything not free is held at, and the priors.
     """
 
@@ -450,9 +439,7 @@ class ParamSpec:
                 from quick_mag.amplitude_head import FEATURES
 
                 universe = list(FEATURES)
-            if kind == "alpha" and pattern in ligands:
-                universe = ligands
-            if kind in ("alpha", "n") and pattern == "*":
+            if kind == "n" and pattern == "*":
                 frees.append(_Free(f"{kind}[*]", kind, tuple(metals)))
                 continue
             hits = [e for e in universe if fnmatch.fnmatchcase(e, pattern)]
@@ -463,12 +450,6 @@ class ParamSpec:
         names = [f.name for f in frees]
         if len(set(names)) != len(names):
             raise ValueError(f"a parameter is freed twice: {names}")
-        for f in frees:
-            if f.kind == "alpha" and len(ligands) == 1 and ligands[0] in f.targets:
-                raise ValueError(
-                    f"alpha[{ligands[0]}] is not separable from the metal alphas with one ligand "
-                    "in the data (only sqrt(alpha_M alpha_L) enters)"
-                )
         self._frees = frees
 
     @property
@@ -510,7 +491,6 @@ class ParamSpec:
     def unpack(self, x) -> PolarizationParameters:
         p = replace(
             self.base,
-            alpha=dict(self.base.alpha),
             w_ligand=dict(self.base.w_ligand), jh_ligand=dict(self.base.jh_ligand),
             t_de=dict(self.base.t_de), j_fm=dict(self.base.j_fm),
             range_power=dict(self.base.range_power),
