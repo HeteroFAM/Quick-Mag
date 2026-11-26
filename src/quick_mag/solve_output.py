@@ -9,7 +9,7 @@ read without parsing that report:
                            ``rank`` (1 = lowest solved; 0 for a reference), ``label`` (G, C(a), ...;
                            the ferromagnetic ordering is written ``FM`` in every file here, a
                            bare ``F`` being extended xyz for "false"),
-                           ``energy``, ``delta_energy`` (above the lowest of its assignment),
+                           ``energy``, ``delta_energy`` (meV; above the lowest of its assignment),
                            ``magnetization``, ``n_unpaired``, ``degeneracy``.
                            Columns: ``magmom`` (signed, mu_B), ``oxidation``, ``spin_state`` -- the
                            states the model used, whether they were given or worked out -- and every
@@ -18,7 +18,7 @@ read without parsing that report:
                            and formal moment of each assignment.
     exchange.csv           the couplings, one row per coupled pair and assignment.
     exchange.graphs.json   the same as graphs on the atoms ("chemlab-graphs/1"): an edge per
-                           coupled pair, its value J (> 0 antiferromagnetic).
+                           coupled pair, its value J in meV/mu_B^2 (> 0 antiferromagnetic).
     summary.json           per assignment: the oxidation distribution, energies, the ground state.
     chemlab.json           what the files above are (kind, units), for a program that collects
                            results by reading one manifest.
@@ -50,11 +50,13 @@ from quick_mag.structure import ChemicalStructure
 MANIFEST_NAME = "chemlab.json"
 MANIFEST_VERSION = 1
 
-#: The units of what is written. Energies are in the exchange parameters' unit, which is
-#: nominally eV (``polarization_model.ExchangeModel``); J is per product of moments.
-ENERGY_UNIT = "eV"
+#: The units of what is written. The model's energies are in the exchange parameters'
+#: unit, nominally eV (``polarization_model.ExchangeModel``); the files give the spin
+#: energies and the couplings in meV, the scale they live on. J is per product of moments.
+ENERGY_UNIT = "meV"
+ENERGY_SCALE = 1000.0          # model energy (eV) -> written energy (meV)
 MOMENT_UNIT = "mu_B"
-COUPLING_UNIT = "eV/mu_B^2"
+COUPLING_UNIT = "meV/mu_B^2"
 DIMENSIONLESS = "[1]"
 
 # Comment-line keys this module sets on a configuration's frame; the input's own keys of
@@ -162,8 +164,8 @@ def _config_frames(result: StructureResult, max_configs: int) -> List[Frame]:
                 "source": source,
                 "rank": rank,
                 "label": file_label(label),
-                "energy": float(config.energy),
-                "delta_energy": float(config.energy - lowest),
+                "energy": float(config.energy) * ENERGY_SCALE,
+                "delta_energy": float(config.energy - lowest) * ENERGY_SCALE,
                 "magnetization": float(config.magnetization),
                 "n_unpaired": float(config.n_unpaired),
                 "degeneracy": int(getattr(config, "degeneracy", 1)),
@@ -192,14 +194,14 @@ def _minimum_image_distance(structure: ChemicalStructure, i: int, j: int) -> flo
 
 
 def _coupled_pairs(model, threshold: float = 1e-12) -> List[Tuple[int, int, float]]:
-    """(atom i, atom j, J) for every coupled pair, i < j, J > 0 antiferromagnetic."""
+    """(atom i, atom j, J in meV/mu_B^2) for every coupled pair, i < j, J > 0 antiferromagnetic."""
     sites = list(model.sites)
     J = np.asarray(model.J, dtype=float)
     pairs = []
     for a in range(len(sites)):
         for b in range(a + 1, len(sites)):
             if abs(J[a, b]) > threshold:
-                pairs.append((int(sites[a]), int(sites[b]), float(J[a, b])))
+                pairs.append((int(sites[a]), int(sites[b]), float(J[a, b]) * ENERGY_SCALE))
     return pairs
 
 
@@ -273,7 +275,7 @@ def _summary(result: StructureResult) -> Dict[str, Any]:
             "oxidation_energy": float(item.assignment.total_energy),
             "magnetic_sites": 0 if item.model is None else len(item.model.sites),
             "method": item.method,
-            "references": {file_label(name): float(config.energy) for name, config in item.reference},
+            "references": {file_label(name): float(config.energy) * ENERGY_SCALE for name, config in item.reference},
             "solved": len(item.solved),
         }
         if item.note:
@@ -284,7 +286,7 @@ def _summary(result: StructureResult) -> Dict[str, Any]:
         if candidates:
             source, label, ground = min(candidates, key=lambda c: c[2].energy)
             entry["ground"] = {
-                "energy": float(ground.energy),
+                "energy": float(ground.energy) * ENERGY_SCALE,
                 "label": file_label(label),
                 "source": source,
                 "magnetization": float(ground.magnetization),

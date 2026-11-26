@@ -1,49 +1,49 @@
 {
   "model": "exchange_polarization",
-  "_fit": "magnets cage_refit.py kk_TD (2026-11-20): installed rules (GK: n_delta, KK) with the empty-eg 10Dq covalency (empty_level_scale); crystal-field orbital order (level_filling, k = 2 field of all ions within 4.5 A), continuous coordination, bond-valence R0, ln_nsig = -1; nine sets with d1d2 = La/Y Ti/V. Free (14): w[O], jh[O], gamma_pi, head_sigma[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd, k_ee, k_dx, t_de[Mn], delta_sat, head_pi[n_eg], j_fm[Ni]",
+  "_fit": "magnets kdx_refit.py N0 (2026-11-24): installed TD refit with k_dx = 0 (direct x bridge interference removed: with k_dd it formed a near-degenerate pair that cancelled direct exchange on short Cr-Cr and made the INS Cr2O3/Cr2TeO6/Cr2WO6 J1 FM). Same nine equal-share PBE+U sets as TD; 13 free: w[O], jh[O], gamma_pi, head_sigma[d_count], j_fm[Cr], j_fm[Mn], j_fm[Co], k_dd, k_ee, t_de[Mn], delta_sat, head_pi[n_eg], j_fm[Ni]",
   "w_ligand": {
-    "O": 0.012406820483929786
+    "O": 0.012491181109414527
   },
   "jh_ligand": {
-    "O": 0.00036170354128628056
+    "O": 0.00041473504546154475
   },
   "t_de": {
-    "Mn": 0.31410092098547837
+    "Mn": 0.31127729248874736
   },
   "j_fm": {
-    "Mn": 0.23688762839173594,
-    "Cr": 0.06157120933656378,
-    "Co": 0.1052183957192798,
-    "Ni": 0.07494332967892071
+    "Mn": 0.24135598109728937,
+    "Cr": 0.11624000912433799,
+    "Co": 0.10282084537548945,
+    "Ni": 0.07336286668260503
   },
-  "gamma_pi": 0.33038399490152165,
+  "gamma_pi": 0.31789463522774086,
   "head_sigma": {
-    "d_count": -0.04203763428717056,
+    "d_count": -0.04200774099882669,
     "ln_delta": -1.0,
     "ln_nsig": -1.0
   },
   "head_pi": {
     "ln_delta": -1.0,
-    "n_eg": -0.7560674248132333
+    "n_eg": -0.8160856797570625
   },
   "w_default": 0.03778326077420451,
   "jh_default": 0.0037783260774204514,
   "t_de_default": 0.0,
   "j_fm_default": 0.0,
-  "k_dd": 1.2785105566481116,
+  "k_dd": 0.750338684388217,
   "dd_cutoff": 3.6,
   "kernel": "coherent",
-  "k_ee": 0.2880363995574775,
+  "k_ee": 0.2872939817253196,
   "oe_rule": "product",
   "k_oe": 0.0,
   "range_power_default": 4.051116908363166,
-  "k_dx": -0.3887730189227215,
+  "k_dx": 0.0,
   "n_delta": 0.0,
   "range_power": {},
   "oe_decay": 1.5,
   "oe_charge": 15.0,
   "de_form": "linear",
-  "delta_sat": 5.604435980593887,
+  "delta_sat": 5.569734524845258,
   "n_min": 2.0,
   "n_max": 8.0,
   "ee_spin": "n_delta",

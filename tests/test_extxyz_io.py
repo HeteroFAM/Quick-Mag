@@ -212,9 +212,10 @@ def test_solve_out_writes_what_the_manifest_lists(tmp_path, capsys):
     for item in items.values():
         assert (out_dir / item["file"]).is_file()
     assert items["configs"]["kind"] == "structures"
-    assert items["configs"]["units"]["energy"] == "eV"
+    assert items["configs"]["units"]["energy"] == "meV"
     assert items["sites"]["level"] == "atoms"
-    assert items["exchange"]["units"]["value"] == "eV/mu_B^2"
+    assert items["exchange"]["units"]["value"] == "meV/mu_B^2"
+    assert 0.01 < max(abs(e["value"]) for e in json.loads((out_dir / "exchange.graphs.json").read_text())["graphs"]["exchange"]["edges"]) < 100.0
 
     frames = read_frames(out_dir / "configs.xyz")
     assert len(frames) == items["configs"]["frames"]

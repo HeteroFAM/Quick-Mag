@@ -302,7 +302,7 @@ def configure_solve_parser(parser: argparse.ArgumentParser) -> argparse.Argument
         "--out", type=Path, default=None, metavar="DIR",
         help="Also write the results into DIR: configs.xyz (every configuration as an "
         "extended xyz frame), sites.csv, exchange.csv, exchange.graphs.json, summary.json "
-        "and chemlab.json, which lists them with their units.",
+        "and chemlab.json, which lists them with their units (spin energies in meV, J in meV/mu_B^2).",
     )
     return parser
 
